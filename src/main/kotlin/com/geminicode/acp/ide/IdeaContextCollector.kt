@@ -1,105 +1,92 @@
 package com.geminicode.acp.ide
 
-import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.VirtualFile
 import java.nio.file.Paths
 
 /**
- * Captures active IntelliJ editor file and selection context for conversational prompts.
+ * 采集 IntelliJ IDEA 活动编辑器或项目树中的轻量级代码位置引用（仅文件路径与 1-based 行号范围，不复制整段源码）。
  */
 object IdeaContextCollector {
 
-    data class EditorContextSnapshot(
-        val absolutePath: String,
-        val displayName: String,
-        val selectionText: String?,
-        val startLine: Int?,
-        val endLine: Int?,
-        val fileText: String?,
-        val truncated: Boolean
-    ) {
-        fun badgeLabel(): String {
-            return if (selectionText != null && startLine != null && endLine != null) {
-                "$displayName (L$startLine-L$endLine)"
-            } else {
-                displayName
-            }
+    /**
+     * 捕获活动编辑器的位置引用：
+     * - 若存在选中内容，返回选中起始行至结束行（自动处理末尾换行符落在下一行第 0 列的情况）；
+     * - 若未选中内容，当 [fallbackToCaretLine] 为 true 时返回光标所在单行，否则返回文件级引用。
+     */
+    fun captureActiveEditorReference(project: Project, fallbackToCaretLine: Boolean = false): CodeReference? {
+        return ReadAction.compute<CodeReference?, RuntimeException> {
+            val editor = FileEditorManager.getInstance(project).selectedTextEditor ?: return@compute null
+            captureFromEditor(project, editor, fallbackToCaretLine)
         }
     }
 
-    fun captureActiveEditorContext(project: Project): EditorContextSnapshot? {
-        val maxChars = GeminiAcpSettingsState.getInstance().state.maxAttachedFileChars
-        return ReadAction.compute<EditorContextSnapshot?, RuntimeException> {
-            val editor = FileEditorManager.getInstance(project).selectedTextEditor ?: return@compute null
+    fun captureFromEditor(project: Project, editor: Editor, fallbackToCaretLine: Boolean): CodeReference? {
+        return ReadAction.compute<CodeReference?, RuntimeException> {
             val document = editor.document
             val vFile = FileDocumentManager.getInstance().getFile(document) ?: return@compute null
-            val absPath = vFile.path
-            val basePath = project.basePath
-            val display = computeRelativeDisplay(basePath, absPath, vFile.name)
+            val absPath = vFile.path.replace('\\', '/')
+            val relPath = computeRelativeDisplay(project.basePath, absPath, vFile.name)
 
             val selection = editor.selectionModel
             if (selection.hasSelection()) {
-                val selectedText = selection.selectedText
-                val startLine = document.getLineNumber(selection.selectionStart) + 1
-                val endLine = document.getLineNumber(selection.selectionEnd) + 1
-                return@compute EditorContextSnapshot(
+                val startOffset = selection.selectionStart
+                val endOffset = selection.selectionEnd
+                val startLine = document.getLineNumber(startOffset) + 1
+                var endLineNum = document.getLineNumber(endOffset)
+                if (endOffset > startOffset && endLineNum > 0 && document.getLineStartOffset(endLineNum) == endOffset) {
+                    endLineNum = document.getLineNumber(endOffset - 1)
+                }
+                val endLine = (endLineNum + 1).coerceAtLeast(startLine)
+                return@compute CodeReference(
                     absolutePath = absPath,
-                    displayName = display,
-                    selectionText = selectedText,
+                    relativePath = relPath,
                     startLine = startLine,
-                    endLine = endLine,
-                    fileText = null,
-                    truncated = false
+                    endLine = endLine
                 )
             }
 
-            val fullText = document.text
-            val isTruncated = fullText.length > maxChars
-            val snippet = if (isTruncated) fullText.substring(0, maxChars) else fullText
-            EditorContextSnapshot(
+            if (fallbackToCaretLine) {
+                val caretLine = document.getLineNumber(editor.caretModel.offset) + 1
+                return@compute CodeReference(
+                    absolutePath = absPath,
+                    relativePath = relPath,
+                    startLine = caretLine,
+                    endLine = caretLine
+                )
+            }
+
+            CodeReference(
                 absolutePath = absPath,
-                displayName = display,
-                selectionText = null,
+                relativePath = relPath,
                 startLine = null,
-                endLine = null,
-                fileText = snippet,
-                truncated = isTruncated
+                endLine = null
             )
         }
     }
 
-    fun formatPromptWithContext(userPrompt: String, context: EditorContextSnapshot?): String {
-        if (context == null) return userPrompt
-        return buildString {
-            appendLine("[IDE Active Context]")
-            appendLine("File Path: ${context.absolutePath}")
-            if (context.selectionText != null) {
-                appendLine("Selected Lines: ${context.startLine}-${context.endLine}")
-                appendLine("```")
-                appendLine(context.selectionText)
-                appendLine("```")
-            } else if (context.fileText != null) {
-                if (context.truncated) {
-                    appendLine("(File content truncated; call read_file if you need remaining lines)")
-                }
-                appendLine("```")
-                appendLine(context.fileText)
-                appendLine("```")
-            }
-            appendLine()
-            append(userPrompt)
-        }
+    fun captureVirtualFileReference(project: Project, vFile: VirtualFile): CodeReference {
+        val absPath = vFile.path.replace('\\', '/')
+        val relPath = computeRelativeDisplay(project.basePath, absPath, vFile.name)
+        return CodeReference(
+            absolutePath = absPath,
+            relativePath = relPath,
+            startLine = null,
+            endLine = null,
+            isDirectory = vFile.isDirectory
+        )
     }
 
     private fun computeRelativeDisplay(basePath: String?, absPath: String, fallbackName: String): String {
-        if (basePath.isNullOrBlank()) return fallbackName
+        if (basePath.isNullOrBlank()) return absPath.ifBlank { fallbackName }
         return runCatching {
             val base = Paths.get(basePath).toAbsolutePath().normalize()
             val target = Paths.get(absPath).toAbsolutePath().normalize()
-            if (target.startsWith(base)) base.relativize(target).toString().replace('\\', '/') else fallbackName
+            if (target.startsWith(base)) base.relativize(target).toString().replace('\\', '/') else absPath
         }.getOrDefault(fallbackName)
     }
 }

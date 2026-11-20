@@ -36,14 +36,18 @@ class AcpClientService(private val project: Project) : Disposable {
     interface AcpEventListener {
         fun onStateChanged(state: ConnectionState, detail: String) {}
         fun onSessionMetadataChanged(metadata: AcpModels.SessionMetadata) {}
+        fun onAvailableCommandsChanged(commands: List<AcpModels.AvailableCommand>) {}
         fun onSessionTitleChanged(title: String) {}
         fun onSessionLoadingStarted(session: AcpModels.SessionSummary) {}
         fun onSessionLoadingFinished(metadata: AcpModels.SessionMetadata?, errorMessage: String?) {}
         fun onSessionUpdate(event: AcpModels.SessionUpdateEvent, isReplay: Boolean) {}
         fun onTurnFinished(stopReason: String?) {}
+        fun onLoggedOut() {}
         fun onAuthUrlDetected(url: String) {}
         fun onLogMessage(message: String) {}
     }
+
+    class LogoutNotSupportedException(message: String) : IllegalStateException(message)
 
     private val logger = Logger.getInstance(AcpClientService::class.java)
     private val gson = Gson()
@@ -80,6 +84,18 @@ class AcpClientService(private val project: Project) : Disposable {
     var availableAuthMethods: List<AcpModels.AuthMethod> = emptyList()
         private set
 
+    @Volatile
+    var supportsLogout: Boolean = false
+        private set
+
+    @Volatile
+    var activeBackendKind: GeminiExecutableResolver.BackendKind? = null
+        private set
+
+    @Volatile
+    var availableCommands: List<AcpModels.AvailableCommand> = emptyList()
+        private set
+
     private val urlRegex = Regex("""https://accounts\.google\.com/[^\s"'<>]+""")
 
     fun addListener(listener: AcpEventListener) {
@@ -92,6 +108,42 @@ class AcpClientService(private val project: Project) : Disposable {
 
     fun connectAndAuthenticate(): CompletableFuture<String> {
         return CompletableFuture.supplyAsync({
+            connectAndAuthenticateBlocking()
+        }, lifecycleExecutor)
+    }
+
+    /**
+     * 通过官方 ACP `logout`（兼容 v2 `auth/logout`）退出当前登录状态并断开连接。
+     * 返回 true 表示服务端已成功执行官方 logout，false 表示当前 CLI 后端未声明 logout 能力（仅断开本地连接）。
+     */
+    fun logout(): CompletableFuture<Boolean> {
+        return CompletableFuture.supplyAsync({
+            val serverLoggedOut = performLogoutOnLifecycleThread()
+            clearAuthAndDisconnectInternal()
+            val detail = if (serverLoggedOut) {
+                "已退出当前账号，点击「登录/连接」或「切换账号」重新登录"
+            } else {
+                "已断开连接（当前 CLI 不支持 ACP logout，请使用「终端登录」重新授权）"
+            }
+            updateState(ConnectionState.DISCONNECTED, detail)
+            listeners.forEach { it.onLoggedOut() }
+            serverLoggedOut
+        }, lifecycleExecutor)
+    }
+
+    /**
+     * 一键切换账号 / 重新登录：先通过官方 ACP `logout` 退出旧账号，再启动全新 ACP 连接重新拉起 Google 账号授权并开启新会话。
+     */
+    fun switchAccount(): CompletableFuture<String> {
+        return CompletableFuture.supplyAsync({
+            val serverLoggedOut = performLogoutOnLifecycleThread()
+            clearAuthAndDisconnectInternal()
+            listeners.forEach { it.onLoggedOut() }
+            if (!serverLoggedOut) {
+                val msg = "当前 CLI 后端未声明官方 ACP logout 能力，请通过「终端登录」切换账号后再点击「登录/连接」。"
+                updateState(ConnectionState.DISCONNECTED, "已断开旧连接，请在终端完成重新登录")
+                throw LogoutNotSupportedException(msg)
+            }
             connectAndAuthenticateBlocking()
         }, lifecycleExecutor)
     }
@@ -366,11 +418,77 @@ class AcpClientService(private val project: Project) : Disposable {
         }
     }
 
-    private fun startAndHandshake(
+    private fun performLogoutOnLifecycleThread(): Boolean {
+        var activeTransport = transport?.takeIf { it.isAlive() }
+        if (activeTransport == null) {
+            val settings = GeminiAcpSettingsState.getInstance().state
+            val resolved = GeminiExecutableResolver.resolveExecutable(
+                settings.geminiExecutablePath,
+                allowNpxFallback = settings.allowNpxFallback
+            )
+            if (!resolved.found || resolved.executablePath == null) {
+                val msg = "未找到 Antigravity CLI (agy) 或 gemini CLI，无法执行退出登录。"
+                updateState(ConnectionState.ERROR, msg)
+                throw IllegalStateException(msg)
+            }
+            val acpFlag = settings.acpFlag.ifBlank { "--acp" }
+            val (launched, _) = launchAndInitializeWithFallback(resolved, acpFlag, settings)
+            activeTransport = launched
+        }
+
+        if (!supportsLogout) {
+            notifyLog("当前 CLI 后端未声明官方 ACP logout 能力")
+            return false
+        }
+
+        updateState(ConnectionState.AUTHENTICATING, "正在通过官方 ACP 退出当前账号...")
+        try {
+            activeTransport.sendRequest("logout", JsonObject(), timeoutSeconds = 30).get()
+            notifyLog("已通过官方 ACP (logout) 成功退出当前账号")
+            return true
+        } catch (firstErr: Throwable) {
+            val root = unwrapCause(firstErr)
+            if (root is JsonRpcTransport.JsonRpcRemoteException && root.code == -32601) {
+                // 兼容未来 ACP v2 的 auth/logout 方法名
+                activeTransport.sendRequest("auth/logout", JsonObject(), timeoutSeconds = 30).get()
+                notifyLog("已通过官方 ACP (auth/logout) 成功退出当前账号")
+                return true
+            }
+            updateState(ConnectionState.ERROR, root.message ?: "退出登录失败")
+            throw root
+        }
+    }
+
+    private fun launchAndInitializeWithFallback(
         resolved: GeminiExecutableResolver.ResolutionResult,
         acpFlag: String,
         settings: GeminiAcpSettingsState.State
-    ): String {
+    ): Pair<JsonRpcTransport, AcpModels.InitializeResult?> {
+        return try {
+            launchAndInitializeTransport(resolved, acpFlag, settings)
+        } catch (firstErr: Throwable) {
+            val root = unwrapCause(firstErr)
+            val msg = root.message.orEmpty()
+            if (resolved.backendKind != GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY &&
+                acpFlag == "--acp" &&
+                (msg.contains("Unknown argument", true) || msg.contains("unknown option", true))
+            ) {
+                notifyLog("检测到旧版 Gemini CLI，自动回退尝试 --experimental-acp...")
+                disconnectInternal()
+                launchAndInitializeTransport(resolved, "--experimental-acp", settings)
+            } else {
+                updateState(ConnectionState.ERROR, msg.ifBlank { "启动或初始化 ACP 服务失败" })
+                throw root
+            }
+        }
+    }
+
+    private fun launchAndInitializeTransport(
+        resolved: GeminiExecutableResolver.ResolutionResult,
+        acpFlag: String,
+        settings: GeminiAcpSettingsState.State
+    ): Pair<JsonRpcTransport, AcpModels.InitializeResult?> {
+        activeBackendKind = resolved.backendKind
         val launchHint = when (resolved.backendKind) {
             GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY -> "正在启动 Antigravity ACP 服务 (agy acp)..."
             GeminiExecutableResolver.BackendKind.NPX_GEMINI_CLI -> "正在通过 npx 启动 @google/gemini-cli ($acpFlag)..."
@@ -405,6 +523,10 @@ class AcpClientService(private val project: Project) : Disposable {
                         when (ev) {
                             is AcpModels.SessionUpdateEvent.ConfigOptionsUpdated ->
                                 applyUpdatedConfigOptions(ev.configOptions)
+                            is AcpModels.SessionUpdateEvent.AvailableCommandsUpdated -> {
+                                availableCommands = ev.commands
+                                listeners.forEach { it.onAvailableCommandsChanged(ev.commands) }
+                            }
                             is AcpModels.SessionUpdateEvent.SessionInfoUpdated -> {
                                 val t = ev.title?.takeIf { it.isNotBlank() }
                                 if (t != null) {
@@ -449,12 +571,22 @@ class AcpClientService(private val project: Project) : Disposable {
         val initJson = newTransport.sendRequest("initialize", AcpModels.InitializeParams(), timeoutSeconds = initTimeoutSec).get()
         val initResult = gson.fromJson(initJson, AcpModels.InitializeResult::class.java)
         availableAuthMethods = initResult?.authMethods.orEmpty()
+        supportsLogout = initResult?.supportsLogout() == true
         val agentName = initResult?.agentInfo?.get("name")?.takeIf { it.isJsonPrimitive }?.asString ?: "ACP Server"
         val agentVer = initResult?.agentInfo?.get("version")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
-        notifyLog("ACP 初始化成功 ($agentName $agentVer)，支持认证方式: ${availableAuthMethods.joinToString { it.id }}")
+        notifyLog("ACP 初始化成功 ($agentName $agentVer)，支持认证方式: ${availableAuthMethods.joinToString { it.id }}，支持切换账号(logout): $supportsLogout")
+        return newTransport to initResult
+    }
+
+    private fun startAndHandshake(
+        resolved: GeminiExecutableResolver.ResolutionResult,
+        acpFlag: String,
+        settings: GeminiAcpSettingsState.State
+    ): String {
+        val (newTransport, _) = launchAndInitializeTransport(resolved, acpFlag, settings)
 
         val chosenAuth = settings.authMethodId.ifBlank { "oauth-personal" }
-        updateState(ConnectionState.AUTHENTICATING, "正在执行 $chosenAuth 认证（首次登录请在弹出的浏览器中授权）...")
+        updateState(ConnectionState.AUTHENTICATING, "正在执行 $chosenAuth 认证（请在弹出的浏览器中完成账号授权）...")
         val authResult = newTransport.sendRequest("authenticate", AcpModels.AuthenticateParams(chosenAuth), timeoutSeconds = 180).get()
         val authTier = AcpModels.extractTierName(authResult)
         notifyLog("$chosenAuth 认证成功" + (authTier?.let { " ($it)" } ?: ""))
@@ -572,6 +704,13 @@ class AcpClientService(private val project: Project) : Disposable {
             env["GOOGLE_CLOUD_PROJECT"] = settings.googleCloudProject.trim()
         }
         return env
+    }
+
+    private fun clearAuthAndDisconnectInternal() {
+        lastMetadata = null
+        availableCommands = emptyList()
+        fsHandler.clearSessionAllowances()
+        disconnectInternal()
     }
 
     private fun disconnectInternal() {

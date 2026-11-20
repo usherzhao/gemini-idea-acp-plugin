@@ -3,6 +3,7 @@ package com.geminicode.acp.protocol
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -266,5 +267,64 @@ class AcpProtocolSerializationTest {
         val setTitleJson = gson.toJsonTree(AcpModels.SetSessionTitleParams("s_hist_1", "自定义对话名")).asJsonObject
         assertEquals("s_hist_1", setTitleJson.get("sessionId").asString)
         assertEquals("自定义对话名", setTitleJson.get("title").asString)
+
+        val cmdsParams = JsonParser.parseString(
+            """
+            {
+              "sessionId": "s_hist_1",
+              "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                  { "name": "plan", "description": "Plan before executing" },
+                  { "name": "ikuai-cli", "description": "Manage iKuai router" }
+                ]
+              }
+            }
+            """.trimIndent()
+        ).asJsonObject
+        val cmdsEv = AcpModels.parseSessionUpdate(cmdsParams) as AcpModels.SessionUpdateEvent.AvailableCommandsUpdated
+        assertEquals(2, cmdsEv.commands.size)
+        assertEquals("ikuai-cli", cmdsEv.commands[1].name)
+    }
+
+    @Test
+    fun `initialize result detects official ACP auth logout capability`() {
+        val agyInitJson = """
+            {
+              "protocolVersion": 1,
+              "agentCapabilities": {
+                "loadSession": true,
+                "auth": { "logout": {} }
+              },
+              "authMethods": [
+                { "id": "oauth-personal", "name": "Log in with Google" }
+              ]
+            }
+        """.trimIndent()
+        val agyInit = gson.fromJson(agyInitJson, AcpModels.InitializeResult::class.java)
+        assertTrue(agyInit.supportsLogout())
+
+        val legacyInitJson = """
+            {
+              "protocolVersion": 1,
+              "agentCapabilities": { "loadSession": false },
+              "authMethods": [
+                { "id": "oauth-personal", "name": "Login with Google" }
+              ]
+            }
+        """.trimIndent()
+        val legacyInit = gson.fromJson(legacyInitJson, AcpModels.InitializeResult::class.java)
+        assertFalse(legacyInit.supportsLogout())
+
+        val v2InitJson = """
+            {
+              "protocolVersion": 2,
+              "authMethods": [
+                { "id": "oauth-personal", "name": "Login with Google" }
+              ]
+            }
+        """.trimIndent()
+        val v2Init = gson.fromJson(v2InitJson, AcpModels.InitializeResult::class.java)
+        assertTrue(v2Init.supportsLogout())
     }
 }

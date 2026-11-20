@@ -1,12 +1,15 @@
 package com.geminicode.acp
 
+import com.geminicode.acp.ide.CodeReference
 import com.geminicode.acp.protocol.AcpClientService
 import com.geminicode.acp.settings.GeminiAcpConfigurable
 import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.geminicode.acp.settings.GeminiExecutableResolver
 import com.geminicode.acp.ui.GeminiChatPanel
 import com.geminicode.acp.ui.GeminiToolWindowFactory
+import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.util.Disposer
+import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
@@ -124,6 +127,64 @@ class PluginPlatformIntegrationTest : BasePlatformTestCase() {
             assertEquals("原始标题", settings.resolveDisplayTitle(sid, "原始标题"))
         } finally {
             settings.setCustomTitle(sid, null)
+        }
+    }
+
+    fun testRightClickActionsAndDirectQuoteIntoInputBox() {
+        val actionManager = ActionManager.getInstance()
+        assertNotNull(actionManager.getAction("GeminiCodeAcp.QuoteProjectFile"))
+        assertNotNull(actionManager.getAction("GeminiCodeAcp.QuoteSelection"))
+        assertNotNull(actionManager.getAction("GeminiCodeAcp.EditorGroup"))
+
+        val panel = GeminiChatPanel(project)
+        try {
+            val ref1 = CodeReference(
+                absolutePath = "${project.basePath}/src/main/java/OrderService.java",
+                relativePath = "src/main/java/OrderService.java"
+            )
+            val ref2 = CodeReference(
+                absolutePath = "${project.basePath}/docs/sub/my spec.md",
+                relativePath = "docs/sub/my spec.md",
+                startLine = 12,
+                endLine = 28
+            )
+            panel.addCodeReferences(listOf(ref1, ref2))
+            PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+
+            val textAfterFirst = panel.currentInputText()
+            // 对话框内仅展示文件名或文件名+行号，不显示全路径
+            assertTrue("Expected @OrderService.java in input box, got: $textAfterFirst", textAfterFirst.contains("@OrderService.java"))
+            assertFalse("Should not show full relative path in input box, got: $textAfterFirst", textAfterFirst.contains("src/main/java/"))
+            assertTrue("Expected quoted whitespace filename with line range, got: $textAfterFirst", textAfterFirst.contains("@\"my spec.md\"#L12-L28"))
+            assertFalse("Should not show parent folder for unique filename, got: $textAfterFirst", textAfterFirst.contains("docs/sub/"))
+
+            // 但解析出的引用必须完整还原真实绝对路径和相对路径供 AI 使用
+            val resolved = panel.currentResolvedReferences()
+            assertEquals(2, resolved.size)
+            assertEquals("src/main/java/OrderService.java", resolved[0].relativePath)
+            assertEquals("docs/sub/my spec.md", resolved[1].relativePath)
+            assertEquals(12, resolved[1].startLine)
+            assertEquals(28, resolved[1].endLine)
+
+            // 重复引用同一个文件不应重复插入
+            panel.addCodeReference(ref1)
+            PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+            assertEquals(textAfterFirst, panel.currentInputText())
+
+            // 同名不同目录的文件自动用最少父目录区分且都能准确还原完整路径
+            val dup1 = CodeReference("${project.basePath}/docs/a/SKILL.md", "docs/a/SKILL.md")
+            val dup2 = CodeReference("${project.basePath}/docs/b/SKILL.md", "docs/b/SKILL.md")
+            panel.addCodeReferences(listOf(dup1, dup2))
+            PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+            val textWithDup = panel.currentInputText()
+            assertTrue(textWithDup.contains("@SKILL.md"))
+            assertTrue(textWithDup.contains("@b/SKILL.md"))
+            val resolvedAll = panel.currentResolvedReferences()
+            assertEquals(4, resolvedAll.size)
+            assertTrue(resolvedAll.any { it.relativePath == "docs/a/SKILL.md" })
+            assertTrue(resolvedAll.any { it.relativePath == "docs/b/SKILL.md" })
+        } finally {
+            Disposer.dispose(panel)
         }
     }
 }

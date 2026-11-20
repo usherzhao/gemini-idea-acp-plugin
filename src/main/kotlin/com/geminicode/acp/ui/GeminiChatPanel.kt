@@ -1,7 +1,10 @@
 package com.geminicode.acp.ui
 
+import com.geminicode.acp.ide.CodeReference
 import com.geminicode.acp.ide.EditorDiffApplyUtil
 import com.geminicode.acp.ide.IdeaContextCollector
+import com.geminicode.acp.ide.ProjectFileIndexHelper
+import com.geminicode.acp.ide.SkillDiscoveryService
 import com.geminicode.acp.protocol.AcpClientService
 import com.geminicode.acp.protocol.AcpModels
 import com.geminicode.acp.settings.GeminiAcpConfigurable
@@ -34,8 +37,12 @@ import java.awt.Insets
 import java.awt.Rectangle
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
+import java.awt.event.FocusAdapter
+import java.awt.event.FocusEvent
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.DefaultComboBoxModel
@@ -47,15 +54,22 @@ import javax.swing.Scrollable
 import javax.swing.SwingUtilities
 import javax.swing.border.CompoundBorder
 import javax.swing.border.LineBorder
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 import javax.swing.event.HyperlinkEvent
 
 /**
  * Gemini 助手主面板：对接官方 Antigravity CLI (agy acp) 的 oauth-personal 登录，
- * 支持动态模型/思考强度/模式选择、历史对话记录浏览与即时切换，以及 IDEA 原生 Diff 修改确认。
+ * 支持 `@` 文件引用补全、`/` 已安装 Skills 补全、编辑器行号轻量引用、历史对话切换、
+ * 底部官方动态模型/思考强度/模式选择以及 IDEA 原生 Diff 预览。
  */
 class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
 
     private val acpService = AcpClientService.getInstance(project)
+    private val completionExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "GeminiAcp-Completion").apply { isDaemon = true }
+    }
+    private val completionSeq = AtomicLong(0)
 
     private val statusLabel = JBLabel("未连接")
     private val accountLabel = JBLabel()
@@ -68,15 +82,22 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         margin = Insets(1, 6, 1, 6)
         toolTipText = "修改当前对话名称"
     }
-    private val connectButton = JButton("oauth-personal 登录/连接")
-    private val terminalLoginButton = JButton("终端登录")
+    private val connectButton = JButton("登录/连接").apply {
+        toolTipText = "通过官方 ACP (oauth-personal) 连接或复用当前账号登录"
+    }
+    private val switchAccountButton = JButton("切换账号").apply {
+        toolTipText = "退出当前账号并通过官方 ACP 重新登录 / 切换 Google 账号"
+    }
+    private val terminalLoginButton = JButton("终端登录").apply {
+        toolTipText = "打开终端执行 agy acp --login 完成交互式浏览器授权"
+    }
     private val historyButton = JButton("历史记录")
     private val newSessionButton = JButton("新对话")
     private val logToggleButton = JButton("日志")
     private val settingsButton = JButton("设置")
 
     /**
-     * 动态配置栏：完全由官方服务端返回的 configOptions（model / thought_level / mode 等）渲染。
+     * 底部动态配置栏：完全由官方服务端返回的 configOptions（model / thought_level / mode 等）渲染。
      */
     private val selectorRow = JPanel(GridBagLayout()).apply {
         isOpaque = false
@@ -126,20 +147,39 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         border = JBUI.Borders.empty()
     }
 
-    private val attachContextCheck = JBCheckBox("附带当前文件/选区上下文", true)
+    private val attachContextCheck = JBCheckBox("自动引用当前文件/行号", true)
     private val contextBadgeLabel = JBLabel("")
+
+    /**
+     * 与输入框内精简 `@文件名` 实时同步的轻量级代码位置引用条，以及精简展示名 -> 真实完整路径的绑定表。
+     * 对话框中仅显示文件名/行号，发送给 AI 时自动还原为精确完整路径。
+     */
+    private val knownInlinePathBindings = LinkedHashMap<String, CodeReference.ResolvedFileBinding>()
+    private val referencesBar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
+        isOpaque = false
+        isVisible = false
+    }
+
     private val inputArea = JBTextArea(3, 40).apply {
         lineWrap = true
         wrapStyleWord = true
-        emptyText.text = "输入需求（例如：重构当前方法、修复空指针、解释这段逻辑），Enter 发送，Shift+Enter 换行"
+        emptyText.text = "输入需求，支持 @ 模糊搜索引用文件、/ 选择已安装 Skills；Enter 发送，Shift+Enter 换行"
     }
     private val sendOrStopButton = JButton("发送")
+
+    private var activeTrigger: InputTriggerParser.ActiveTrigger? = null
+    private var suppressTriggerRefresh = false
+    private lateinit var completionPopup: InputCompletionPopup
+
+    @Volatile
+    private var cachedLocalSkills: List<AcpModels.AvailableCommand> = emptyList()
 
     private var activeAssistantCard: AssistantTurnCard? = null
     private var activeReplayUserCard: UserTurnCard? = null
     private var replayedMessageCount = 0
     private var isStreaming = false
     private var isLoadingHistory = false
+    private var loggedOutExplicitly = false
 
     private fun runOnUi(action: () -> Unit) {
         ApplicationManager.getApplication().invokeLater({
@@ -164,19 +204,28 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 }
                 sendOrStopButton.text = if (isStreaming) "停止" else "发送"
                 sendOrStopButton.isEnabled = !isLoadingHistory
-                connectButton.isEnabled = state != AcpClientService.ConnectionState.CONNECTING &&
-                    state != AcpClientService.ConnectionState.AUTHENTICATING
+                val busyAuth = state == AcpClientService.ConnectionState.CONNECTING ||
+                    state == AcpClientService.ConnectionState.AUTHENTICATING
+                connectButton.isEnabled = !busyAuth
+                switchAccountButton.isEnabled = !busyAuth && !isStreaming && !isLoadingHistory
                 historyButton.isEnabled = !isStreaming && !isLoadingHistory
-                refreshAccountStatus()
                 if (state == AcpClientService.ConnectionState.READY) {
+                    loggedOutExplicitly = false
                     bannerPanel.isVisible = false
                 }
+                refreshAccountStatus()
             }
         }
 
         override fun onSessionMetadataChanged(metadata: AcpModels.SessionMetadata) {
             runOnUi {
                 rebuildOfficialConfigSelectors(metadata)
+            }
+        }
+
+        override fun onAvailableCommandsChanged(commands: List<AcpModels.AvailableCommand>) {
+            runOnUi {
+                appendDiagnosticLog("已同步官方 Skills / 斜杠命令列表：共 ${commands.size} 项")
             }
         }
 
@@ -191,6 +240,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 isLoadingHistory = true
                 sendOrStopButton.isEnabled = false
                 historyButton.isEnabled = false
+                switchAccountButton.isEnabled = false
                 activeAssistantCard = null
                 activeReplayUserCard = null
                 replayedMessageCount = 0
@@ -208,6 +258,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 isLoadingHistory = false
                 sendOrStopButton.isEnabled = true
                 historyButton.isEnabled = true
+                switchAccountButton.isEnabled = !isStreaming
                 activeAssistantCard?.finalizeTurn(null)
                 activeAssistantCard = null
                 activeReplayUserCard = null
@@ -243,6 +294,19 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             }
         }
 
+        override fun onLoggedOut() {
+            runOnUi {
+                loggedOutExplicitly = true
+                detectedAuthUrl = null
+                selectorRow.removeAll()
+                selectorRow.isVisible = false
+                selectorRow.revalidate()
+                selectorRow.repaint()
+                sessionTitleLabel.text = "当前对话：新对话"
+                refreshAccountStatus()
+            }
+        }
+
         override fun onAuthUrlDetected(url: String) {
             runOnUi {
                 detectedAuthUrl = url
@@ -264,14 +328,24 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
     init {
         attachContextCheck.isSelected = GeminiAcpSettingsState.getInstance().state.includeActiveFileByDefault
+        completionPopup = InputCompletionPopup(inputArea) { chosen ->
+            applyCompletionItem(chosen)
+        }
         buildLayout()
         wireActions()
         acpService.addListener(eventListener)
         acpService.lastMetadata?.let { rebuildOfficialConfigSelectors(it) }
         acpService.activeSessionTitle?.let { sessionTitleLabel.text = "当前对话：$it" }
+        preloadLocalSkillsAsync()
         refreshAccountStatus()
         refreshContextPreview()
         addWelcomeCard()
+    }
+
+    private fun preloadLocalSkillsAsync() {
+        completionExecutor.submit {
+            cachedLocalSkills = SkillDiscoveryService.discoverLocalSkills(project.basePath)
+        }
     }
 
     private fun handleReplayEvent(event: AcpModels.SessionUpdateEvent) {
@@ -285,7 +359,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 if (existingUser != null) {
                     existingUser.appendText(event.text)
                 } else {
-                    val userCard = UserTurnCard(event.text, null)
+                    val userCard = UserTurnCard(event.text, emptyList())
                     activeReplayUserCard = userCard
                     replayedMessageCount++
                     addCard(userCard)
@@ -312,6 +386,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 card.appendPlan(event.summary)
             }
             is AcpModels.SessionUpdateEvent.ConfigOptionsUpdated,
+            is AcpModels.SessionUpdateEvent.AvailableCommandsUpdated,
             is AcpModels.SessionUpdateEvent.SessionInfoUpdated,
             is AcpModels.SessionUpdateEvent.UsageEvent,
             is AcpModels.SessionUpdateEvent.Other -> Unit
@@ -337,6 +412,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             is AcpModels.SessionUpdateEvent.PlanEvent -> card.appendPlan(event.summary)
             is AcpModels.SessionUpdateEvent.UserMessageChunk,
             is AcpModels.SessionUpdateEvent.ConfigOptionsUpdated,
+            is AcpModels.SessionUpdateEvent.AvailableCommandsUpdated,
             is AcpModels.SessionUpdateEvent.SessionInfoUpdated,
             is AcpModels.SessionUpdateEvent.UsageEvent,
             is AcpModels.SessionUpdateEvent.Other -> Unit
@@ -367,6 +443,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         val buttonRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
             isOpaque = false
             add(connectButton)
+            add(switchAccountButton)
             add(terminalLoginButton)
             add(historyButton)
             add(newSessionButton)
@@ -394,14 +471,14 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
         topBar.add(headerStack, BorderLayout.CENTER)
 
-        val composer = JPanel(BorderLayout(6, 6)).apply {
+        val composer = JPanel(BorderLayout(6, 4)).apply {
             border = CompoundBorder(
                 JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0),
                 JBUI.Borders.empty(8)
             )
         }
 
-        val refreshCtxBtn = JButton("刷新上下文").apply {
+        val refreshCtxBtn = JButton("刷新位置").apply {
             addActionListener { refreshContextPreview() }
         }
         val contextBar = JPanel(BorderLayout(6, 0)).apply {
@@ -409,6 +486,15 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(attachContextCheck, BorderLayout.WEST)
             add(contextBadgeLabel, BorderLayout.CENTER)
             add(refreshCtxBtn, BorderLayout.EAST)
+        }
+
+        val composerTopStack = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            contextBar.alignmentX = LEFT_ALIGNMENT
+            referencesBar.alignmentX = LEFT_ALIGNMENT
+            add(contextBar)
+            add(referencesBar)
         }
 
         val inputScroll = JBScrollPane(inputArea).apply {
@@ -421,7 +507,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(sendOrStopButton, BorderLayout.EAST)
         }
 
-        composer.add(contextBar, BorderLayout.NORTH)
+        composer.add(composerTopStack, BorderLayout.NORTH)
         composer.add(inputActionRow, BorderLayout.CENTER)
         composer.add(selectorRow, BorderLayout.SOUTH)
 
@@ -580,6 +666,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
     private fun wireActions() {
         connectButton.addActionListener { triggerConnect() }
+        switchAccountButton.addActionListener { triggerSwitchAccount() }
         terminalLoginButton.addActionListener { TerminalLoginLauncher.launchInteractiveGeminiLogin(project) }
         historyButton.addActionListener { openHistoryDialog() }
         renameCurrentButton.addActionListener { renameCurrentSession() }
@@ -625,14 +712,316 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 sendFromInputBox()
             }
         }
+
+        inputArea.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent?) = scheduleCompletionCheck()
+            override fun removeUpdate(e: DocumentEvent?) = scheduleCompletionCheck()
+            override fun changedUpdate(e: DocumentEvent?) = Unit
+        })
+        inputArea.addFocusListener(object : FocusAdapter() {
+            override fun focusLost(e: FocusEvent?) {
+                SwingUtilities.invokeLater {
+                    if (!inputArea.isFocusOwner) {
+                        completionPopup.hide()
+                    }
+                }
+            }
+        })
         inputArea.addKeyListener(object : KeyAdapter() {
             override fun keyPressed(e: KeyEvent) {
+                if (completionPopup.isVisible) {
+                    when (e.keyCode) {
+                        KeyEvent.VK_DOWN -> {
+                            completionPopup.moveSelection(1)
+                            e.consume()
+                            return
+                        }
+                        KeyEvent.VK_UP -> {
+                            completionPopup.moveSelection(-1)
+                            e.consume()
+                            return
+                        }
+                        KeyEvent.VK_ENTER, KeyEvent.VK_TAB -> {
+                            if (completionPopup.confirmSelection()) {
+                                e.consume()
+                                return
+                            }
+                        }
+                        KeyEvent.VK_ESCAPE -> {
+                            completionPopup.hide()
+                            e.consume()
+                            return
+                        }
+                    }
+                }
+
                 if (e.keyCode == KeyEvent.VK_ENTER && !e.isShiftDown && !isStreaming && !isLoadingHistory) {
                     e.consume()
                     sendFromInputBox()
                 }
             }
         })
+    }
+
+    private fun scheduleCompletionCheck() {
+        if (suppressTriggerRefresh) return
+        SwingUtilities.invokeLater {
+            if (project.isDisposed || suppressTriggerRefresh) return@invokeLater
+            val text = inputArea.text
+            val caret = inputArea.caretPosition
+            val trigger = InputTriggerParser.detectTrigger(text, caret)
+            activeTrigger = trigger
+            val activeMentionRange = if (trigger?.kind == InputTriggerParser.TriggerKind.FILE_MENTION) {
+                trigger.tokenStart until trigger.caretOffset
+            } else {
+                null
+            }
+            syncReferencesBarFromInput(activeMentionRange)
+
+            if (trigger == null) {
+                completionPopup.hide()
+                return@invokeLater
+            }
+
+            val seq = completionSeq.incrementAndGet()
+            when (trigger.kind) {
+                InputTriggerParser.TriggerKind.FILE_MENTION -> {
+                    completionExecutor.submit {
+                        val files = ProjectFileIndexHelper.searchProjectFiles(
+                            project = project,
+                            query = trigger.query,
+                            limit = 30,
+                            isCancelled = { completionSeq.get() != seq }
+                        )
+                        val items = files.map { f ->
+                            val openTag = if (f.openInEditor) " [已打开]" else ""
+                            val ref = CodeReference(
+                                absolutePath = f.absolutePath,
+                                relativePath = f.relativePath
+                            )
+                            InputCompletionPopup.CompletionItem(
+                                iconPrefix = "📄",
+                                primaryText = f.fileName + openTag,
+                                secondaryText = f.relativePath,
+                                insertText = "${ref.inlineToken()} ",
+                                payload = ref
+                            )
+                        }
+                        runOnUi {
+                            if (completionSeq.get() != seq) return@runOnUi
+                            completionPopup.showItems("模糊搜索项目文件 (@) — 支持文件名/驼峰/路径，↑↓选择，Enter/Tab确认", items)
+                        }
+                    }
+                }
+                InputTriggerParser.TriggerKind.SKILL_COMMAND -> {
+                    completionExecutor.submit {
+                        if (cachedLocalSkills.isEmpty()) {
+                            cachedLocalSkills = SkillDiscoveryService.discoverLocalSkills(project.basePath)
+                        }
+                        val merged = SkillDiscoveryService.mergeCommands(
+                            acpService.availableCommands,
+                            cachedLocalSkills
+                        )
+                        val q = trigger.query.trim().lowercase()
+                        val filtered = if (q.isEmpty()) {
+                            merged.take(30)
+                        } else {
+                            merged.mapNotNull { cmd ->
+                                val nameLower = cmd.name.lowercase()
+                                val descLower = cmd.description.orEmpty().lowercase()
+                                val score = when {
+                                    nameLower == q -> 5_000
+                                    nameLower.startsWith(q) -> 4_000
+                                    nameLower.contains(q) -> 3_000
+                                    descLower.contains(q) -> 2_000
+                                    else -> {
+                                        val fuzzy = ProjectFileIndexHelper.fuzzySubsequenceScore(cmd.name, q)
+                                        if (fuzzy >= 0) 1_000 + fuzzy else -1
+                                    }
+                                }
+                                if (score >= 0) score to cmd else null
+                            }.sortedByDescending { it.first }
+                                .take(30)
+                                .map { it.second }
+                        }
+
+                        val items = filtered.map { cmd ->
+                            InputCompletionPopup.CompletionItem(
+                                iconPrefix = "⚡",
+                                primaryText = "/${cmd.name}",
+                                secondaryText = cmd.description.orEmpty(),
+                                insertText = "/${cmd.name} ",
+                                payload = cmd
+                            )
+                        }
+                        runOnUi {
+                            if (completionSeq.get() != seq) return@runOnUi
+                            completionPopup.showItems("已安装的 Skills 与命令 (/) — 支持模糊搜索，↑↓选择，Enter/Tab确认", items)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyCompletionItem(item: InputCompletionPopup.CompletionItem) {
+        val trigger = activeTrigger ?: return
+        val currentText = inputArea.text
+        if (trigger.tokenStart > currentText.length || trigger.caretOffset > currentText.length) return
+
+        val insertText = when (val payload = item.payload) {
+            is CodeReference -> "${registerDisplayBinding(payload).inlineToken()} "
+            else -> item.insertText
+        }
+
+        suppressTriggerRefresh = true
+        try {
+            val before = currentText.substring(0, trigger.tokenStart)
+            val after = currentText.substring(trigger.caretOffset)
+            val newText = before + insertText + after
+            inputArea.text = newText
+            inputArea.caretPosition = (before.length + insertText.length).coerceAtMost(newText.length)
+            activeTrigger = null
+        } finally {
+            suppressTriggerRefresh = false
+        }
+        syncReferencesBarFromInput()
+        inputArea.requestFocusInWindow()
+    }
+
+    private fun registerDisplayBinding(ref: CodeReference): CodeReference {
+        val uniqueDisplay = CodeReference.resolveUniqueDisplayPath(ref, knownInlinePathBindings)
+        knownInlinePathBindings[uniqueDisplay.lowercase()] = CodeReference.ResolvedFileBinding(
+            absolutePath = ref.absolutePath,
+            relativePath = ref.relativePath,
+            displayPath = uniqueDisplay,
+            isDirectory = ref.isDirectory
+        )
+        return ref.copy(displayPath = uniqueDisplay)
+    }
+
+    /**
+     * 将编辑器某一行/多行或项目树/标签页右键选中的文件/目录作为轻量 `@文件名`（或 `@文件名#L起-L止`）引用直接插入对话框内（不复制源码）。
+     */
+    fun addCodeReference(ref: CodeReference) = addCodeReferences(listOf(ref))
+
+    internal fun currentInputText(): String = inputArea.text
+
+    internal fun currentResolvedReferences(): List<CodeReference> =
+        CodeReference.extractInlineReferences(inputArea.text, project.basePath, bindings = knownInlinePathBindings)
+
+    fun addCodeReferences(refs: List<CodeReference>) {
+        if (refs.isEmpty()) return
+        runOnUi {
+            completionPopup.hide()
+            activeTrigger = null
+            val existingKeys = CodeReference.extractInlineReferences(
+                inputArea.text,
+                project.basePath,
+                bindings = knownInlinePathBindings
+            ).map { it.dedupKey() }.toMutableSet()
+            val tokensToInsert = mutableListOf<String>()
+            for (ref in refs) {
+                if (existingKeys.add(ref.dedupKey())) {
+                    val boundRef = registerDisplayBinding(ref)
+                    tokensToInsert.add(boundRef.inlineToken())
+                }
+            }
+            if (tokensToInsert.isNotEmpty()) {
+                val current = inputArea.text
+                val caret = inputArea.caretPosition.coerceIn(0, current.length)
+                val before = current.substring(0, caret)
+                val after = current.substring(caret)
+                val leadingSpace = if (before.isNotEmpty() && !before.last().isWhitespace()) " " else ""
+                val trailingSpace = if (after.isEmpty() || !after.first().isWhitespace()) " " else ""
+                val inserted = leadingSpace + tokensToInsert.joinToString(" ") + trailingSpace
+
+                suppressTriggerRefresh = true
+                try {
+                    val updated = before + inserted + after
+                    inputArea.text = updated
+                    inputArea.caretPosition = (before.length + inserted.length).coerceAtMost(updated.length)
+                } finally {
+                    suppressTriggerRefresh = false
+                }
+            }
+            syncReferencesBarFromInput()
+            SwingUtilities.invokeLater {
+                if (!project.isDisposed) {
+                    inputArea.requestFocusInWindow()
+                }
+            }
+        }
+    }
+
+    private fun syncReferencesBarFromInput(excludeRange: IntRange? = null) {
+        val refs = CodeReference.extractInlineReferences(
+            inputArea.text,
+            project.basePath,
+            excludeRange = excludeRange,
+            bindings = knownInlinePathBindings
+        )
+        if (excludeRange == null) {
+            val activeAliases = refs.map { it.shortName().lowercase() }.toSet()
+            knownInlinePathBindings.keys.retainAll(activeAliases)
+        }
+        referencesBar.removeAll()
+        if (refs.isEmpty()) {
+            referencesBar.isVisible = false
+            referencesBar.revalidate()
+            referencesBar.repaint()
+            return
+        }
+
+        for (ref in refs) {
+            val icon = if (ref.isDirectory) "📁" else "📌"
+            val chip = JButton("$icon ${ref.chipLabel()}  ×").apply {
+                font = font.deriveFont(11f)
+                margin = Insets(1, 6, 1, 6)
+                toolTipText = "<html>点击移除该引用（不粘贴源码，仅传递路径与行号）<br/>相对路径：${ref.relativePath}<br/>完整路径：${ref.absolutePath}</html>"
+                addActionListener {
+                    suppressTriggerRefresh = true
+                    try {
+                        val updated = CodeReference.removeReferenceToken(
+                            inputArea.text,
+                            ref,
+                            project.basePath,
+                            bindings = knownInlinePathBindings
+                        )
+                        inputArea.text = updated
+                        inputArea.caretPosition = updated.length
+                    } finally {
+                        suppressTriggerRefresh = false
+                    }
+                    syncReferencesBarFromInput()
+                    inputArea.requestFocusInWindow()
+                }
+            }
+            referencesBar.add(chip)
+        }
+        if (refs.size > 1) {
+            val clearAllBtn = JButton("清空引用").apply {
+                font = font.deriveFont(11f)
+                margin = Insets(1, 6, 1, 6)
+                addActionListener {
+                    suppressTriggerRefresh = true
+                    try {
+                        val updated = CodeReference.removeAllReferenceTokens(inputArea.text)
+                        inputArea.text = updated
+                        inputArea.caretPosition = updated.length
+                    } finally {
+                        suppressTriggerRefresh = false
+                    }
+                    knownInlinePathBindings.clear()
+                    syncReferencesBarFromInput()
+                    inputArea.requestFocusInWindow()
+                }
+            }
+            referencesBar.add(clearAllBtn)
+        }
+        referencesBar.isVisible = true
+        referencesBar.revalidate()
+        referencesBar.repaint()
     }
 
     private fun renameCurrentSession() {
@@ -671,6 +1060,99 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
     }
 
+    private fun triggerSwitchAccount() {
+        if (isStreaming || isLoadingHistory) {
+            Messages.showInfoMessage(project, "请先等待当前生成或历史加载完成，再切换账号。", "切换账号")
+            return
+        }
+        val settings = GeminiAcpSettingsState.getInstance().state
+        val resolved = GeminiExecutableResolver.resolveExecutable(
+            settings.geminiExecutablePath,
+            allowNpxFallback = settings.allowNpxFallback
+        )
+        if (!resolved.found) {
+            bannerText.text = "<html>未检测到 <code>agy</code> (Antigravity CLI)，请先安装 https://antigravity.google 或在设置中指定路径。</html>"
+            bannerActionBtn.text = "获取 Antigravity CLI"
+            detectedAuthUrl = "https://antigravity.google"
+            bannerPanel.isVisible = true
+            return
+        }
+
+        val choice = Messages.showDialog(
+            project,
+            "将通过官方 ACP 协议退出当前账号并重新授权登录：\n\n" +
+                "• 「切换账号并重新登录」：先登出当前账号，再自动拉起 Google 账号授权并开启新对话；\n" +
+                "• 「仅退出登录」：仅退出当前账号并断开连接。",
+            "切换账号 / 重新登录",
+            arrayOf("切换账号并重新登录", "仅退出登录", "取消"),
+            0,
+            Messages.getQuestionIcon()
+        )
+        when (choice) {
+            0 -> {
+                detectedAuthUrl = null
+                acpService.switchAccount().whenComplete { _, err ->
+                    runOnUi {
+                        if (err == null) {
+                            messagesContainer.removeAll()
+                            addWelcomeCard()
+                            addHistoryBannerCard("已切换账号并重新登录成功，当前已开启全新对话。")
+                            messagesContainer.revalidate()
+                            messagesContainer.repaint()
+                            refreshAccountStatus()
+                            scrollToBottom()
+                        } else {
+                            val root = (err as? java.util.concurrent.CompletionException)?.cause ?: err
+                            if (root is AcpClientService.LogoutNotSupportedException) {
+                                detectedAuthUrl = null
+                                bannerText.text = "<html>当前 CLI 后端未支持 ACP <code>logout</code>，请点击右侧打开终端重新登录：</html>"
+                                bannerActionBtn.text = "打开终端登录"
+                                bannerPanel.isVisible = true
+                            } else if (detectedAuthUrl == null) {
+                                bannerText.text = "<html>已退出旧账号，若浏览器未自动打开授权页，请点击右侧通过终端执行 <code>agy acp --login</code>：</html>"
+                                bannerActionBtn.text = "打开终端登录"
+                                bannerPanel.isVisible = true
+                            }
+                            val card = AssistantTurnCard()
+                            addCard(card)
+                            card.appendBody(
+                                "⚠️ 切换账号 / 重新登录未完成：${root.message}\n\n" +
+                                    "排查与操作建议：\n" +
+                                    "1. 若浏览器已弹出 Google 登录页，请完成账号选择授权后点击顶部 **「登录/连接」**；\n" +
+                                    "2. 若未自动弹出浏览器，请点击顶部 **「终端登录」** 运行 `agy acp --login` 完成新账号授权，再点击 **「登录/连接」**；\n" +
+                                    "3. 如需代理访问 Google 服务，请点击 **「设置」** 填写 `HTTP/HTTPS_PROXY`。"
+                            )
+                            card.finalizeTurn("error")
+                            scrollToBottom()
+                        }
+                    }
+                }
+            }
+            1 -> {
+                acpService.logout().whenComplete { serverLoggedOut, err ->
+                    runOnUi {
+                        if (err != null) {
+                            val root = (err as? java.util.concurrent.CompletionException)?.cause ?: err
+                            Messages.showErrorDialog(project, root.message ?: "退出登录失败", "退出登录")
+                        } else {
+                            messagesContainer.removeAll()
+                            addWelcomeCard()
+                            val msg = if (serverLoggedOut) {
+                                "已退出当前账号登录状态。点击顶部 <b>「登录/连接」</b> 或 <b>「切换账号」</b> 即可使用其他账号重新登录。"
+                            } else {
+                                "已断开当前连接（旧版 CLI 不支持 ACP <code>logout</code>，请使用顶部 <b>「终端登录」</b> 重新授权）。"
+                            }
+                            addHistoryBannerCard(msg)
+                            messagesContainer.revalidate()
+                            messagesContainer.repaint()
+                            scrollToBottom()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun triggerConnect() {
         val settings = GeminiAcpSettingsState.getInstance().state
         val resolved = GeminiExecutableResolver.resolveExecutable(
@@ -702,37 +1184,57 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
     }
 
-    fun sendExternalPrompt(userPrompt: String, context: IdeaContextCollector.EditorContextSnapshot?) {
+    fun sendExternalPrompt(userPrompt: String, references: List<CodeReference>) {
         runOnUi {
-            executePromptTurn(userPrompt, context)
+            executePromptTurn(userPrompt, references)
         }
     }
 
     private fun sendFromInputBox() {
+        completionPopup.hide()
+        activeTrigger = null
         val text = inputArea.text.trim()
         if (text.isEmpty()) return
-        inputArea.text = ""
-        val context = if (attachContextCheck.isSelected) {
-            IdeaContextCollector.captureActiveEditorContext(project)
-        } else {
-            null
+
+        val collectedRefs = mutableListOf<CodeReference>()
+        collectedRefs.addAll(
+            CodeReference.extractInlineReferences(text, project.basePath, bindings = knownInlinePathBindings)
+        )
+
+        knownInlinePathBindings.clear()
+        suppressTriggerRefresh = true
+        try {
+            inputArea.text = ""
+        } finally {
+            suppressTriggerRefresh = false
+        }
+        syncReferencesBarFromInput()
+
+        if (attachContextCheck.isSelected) {
+            IdeaContextCollector.captureActiveEditorReference(project, fallbackToCaretLine = false)?.let {
+                collectedRefs.add(it)
+            }
         }
         refreshContextPreview()
-        executePromptTurn(text, context)
+
+        executePromptTurn(text, collectedRefs)
     }
 
-    private fun executePromptTurn(userPrompt: String, context: IdeaContextCollector.EditorContextSnapshot?) {
+    private fun executePromptTurn(userPrompt: String, references: List<CodeReference>) {
         if (isStreaming || isLoadingHistory) {
             Messages.showInfoMessage(project, "正在处理中，请稍候或先点击停止。", "Gemini 助手")
             return
         }
-        addCard(UserTurnCard(userPrompt, context?.badgeLabel()))
+        val uniqueRefs = references.distinctBy {
+            Triple(it.absolutePath.replace('\\', '/').lowercase(), it.startLine, it.endLine)
+        }
+        addCard(UserTurnCard(userPrompt, uniqueRefs.map { it.chipLabel() }))
         val assistantCard = AssistantTurnCard()
         activeAssistantCard = assistantCard
         addCard(assistantCard)
         scrollToBottom()
 
-        val fullPrompt = IdeaContextCollector.formatPromptWithContext(userPrompt, context)
+        val fullPrompt = CodeReference.formatPromptWithReferences(userPrompt, uniqueRefs)
         acpService.sendPrompt(fullPrompt).whenComplete { _, err ->
             if (err != null) {
                 runOnUi {
@@ -755,7 +1257,21 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     }
 
     private fun refreshAccountStatus() {
+        val state = acpService.currentState
         val tier = acpService.lastMetadata?.tierName
+        val backend = acpService.activeBackendKind
+        if (loggedOutExplicitly && state != AcpClientService.ConnectionState.READY) {
+            accountLabel.text = "未登录"
+            return
+        }
+        if (backend == GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY) {
+            accountLabel.text = when {
+                tier != null -> "Antigravity ($tier)"
+                state == AcpClientService.ConnectionState.READY -> "Antigravity 已登录"
+                else -> "未登录"
+            }
+            return
+        }
         val info = GeminiExecutableResolver.readCachedAccountInfo()
         accountLabel.text = when {
             tier != null && info.activeEmail != null -> "${info.activeEmail} ($tier)"
@@ -767,8 +1283,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     }
 
     private fun refreshContextPreview() {
-        val ctx = IdeaContextCollector.captureActiveEditorContext(project)
-        contextBadgeLabel.text = ctx?.badgeLabel() ?: "无活动编辑器"
+        val ref = IdeaContextCollector.captureActiveEditorReference(project, fallbackToCaretLine = false)
+        contextBadgeLabel.text = ref?.chipLabel() ?: "无活动编辑器"
+        contextBadgeLabel.toolTipText = ref?.let { "<html>相对路径：${it.relativePath}<br/>完整路径：${it.absolutePath}</html>" }
     }
 
     private fun addHistoryBannerCard(text: String) {
@@ -808,13 +1325,13 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 JBUI.Borders.empty(10)
             )
             background = JBColor(Color(0xF8FAFC), Color(0x1E293B))
-            maximumSize = Dimension(Int.MAX_VALUE, 280)
+            maximumSize = Dimension(Int.MAX_VALUE, 300)
             add(
                 JBLabel(
                     "<html><b>Gemini 对话编程助手 (ACP)</b><br/>" +
-                        "1. 点击上方 <b>oauth-personal 登录/连接</b>，直连官方 <code>agy acp</code> 服务。<br/>" +
-                        "2. 连接后自动从官方获取 <b>模型</b>、<b>思考强度</b> 和 <b>模式</b> 选项，并可点 <b>「历史记录」</b> 随时浏览、搜索与切换历史对话。<br/>" +
-                        "3. 修改代码前会弹出 IDEA 原生 <b>Diff 对比确认窗</b>，确认后支持 <code>Ctrl+Z</code> 撤销。<br/><br/>" +
+                        "1. 输入 <code>@</code> 可<b>模糊搜索</b>并引用项目文件（支持文件名/驼峰首字母/路径）；输入 <code>/</code> 可模糊选择已安装的 Skills。<br/>" +
+                        "2. 在左侧项目树、编辑器标签页或导航栏<b>右键文件 → 引用文件到 Gemini 对话框</b>，或在编辑器内右键引用<b>选中行/当前行</b>，仅传路径与行号不粘贴源码。<br/>" +
+                        "3. 底部可切换官方 <b>模型 / 思考强度 / 模式</b>，顶部可查看并重命名 <b>历史记录</b>。<br/><br/>" +
                         "<b>环境检测：</b>$envHint</html>"
                 ),
                 BorderLayout.CENTER
@@ -838,13 +1355,15 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     }
 
     override fun dispose() {
+        completionPopup.hide()
+        completionExecutor.shutdownNow()
         acpService.removeListener(eventListener)
         if (!project.isDisposed && project.getUserData(GeminiToolWindowFactory.CHAT_PANEL_KEY) === this) {
             project.putUserData(GeminiToolWindowFactory.CHAT_PANEL_KEY, null)
         }
     }
 
-    private inner class UserTurnCard(prompt: String, contextBadge: String?) : JPanel(BorderLayout(0, 4)) {
+    private inner class UserTurnCard(prompt: String, refBadges: List<String>) : JPanel(BorderLayout(0, 4)) {
         private val area = JBTextArea(prompt).apply {
             isEditable = false
             lineWrap = true
@@ -859,7 +1378,11 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 JBUI.Borders.empty(8)
             )
             background = JBColor(Color(0xEFF6FF), Color(0x172554))
-            val header = if (contextBadge != null) "你  ·  附带：$contextBadge" else "你"
+            val header = if (refBadges.isNotEmpty()) {
+                "你  ·  引用：${refBadges.joinToString(", ")}"
+            } else {
+                "你"
+            }
             add(JBLabel("<html><b>$header</b></html>"), BorderLayout.NORTH)
             add(area, BorderLayout.CENTER)
         }
@@ -946,8 +1469,13 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 "pending" -> "等待中"
                 else -> "执行中"
             }
-            val locText = if (ev.locations.isNotEmpty()) " (${ev.locations.joinToString(", ")})" else ""
+            val locText = if (ev.locations.isNotEmpty()) {
+                " (${ev.locations.joinToString(", ") { CodeReference.shortenLocationDisplay(it) }})"
+            } else {
+                ""
+            }
             label.text = "$statusIcon ${ev.title}$locText [$statusText]"
+            label.toolTipText = if (ev.locations.isNotEmpty()) ev.locations.joinToString("\n") else null
             toolsPanel.revalidate()
         }
 

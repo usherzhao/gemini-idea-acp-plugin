@@ -12,10 +12,11 @@ object AcpModels {
 
     private val internalGson = Gson()
     private val configOptionsListType = object : TypeToken<List<ConfigOption>>() {}.type
+    private val availableCommandsListType = object : TypeToken<List<AvailableCommand>>() {}.type
 
     data class ClientInfo(
         val name: String = "gemini-idea-acp-plugin",
-        val version: String = "1.0.6"
+        val version: String = "1.0.10"
     )
 
     data class FsCapabilities(
@@ -44,7 +45,13 @@ object AcpModels {
         val authMethods: List<AuthMethod> = emptyList(),
         val agentInfo: JsonObject? = null,
         val agentCapabilities: JsonObject? = null
-    )
+    ) {
+        fun supportsLogout(): Boolean {
+            if (protocolVersion >= 2 && authMethods.isNotEmpty()) return true
+            val authObj = agentCapabilities?.getAsJsonObject("auth") ?: return false
+            return authObj.has("logout") && !authObj.get("logout").isJsonNull
+        }
+    }
 
     data class AuthenticateParams(
         val methodId: String
@@ -187,6 +194,12 @@ object AcpModels {
         val sessionId: String
     )
 
+    data class AvailableCommand(
+        val name: String,
+        val description: String? = null,
+        val source: String = "acp"
+    )
+
     data class FsReadTextFileParams(
         val sessionId: String? = null,
         val path: String,
@@ -240,6 +253,7 @@ object AcpModels {
         ) : SessionUpdateEvent()
         data class PlanEvent(val summary: String) : SessionUpdateEvent()
         data class ConfigOptionsUpdated(val configOptions: List<ConfigOption>) : SessionUpdateEvent()
+        data class AvailableCommandsUpdated(val commands: List<AvailableCommand>) : SessionUpdateEvent()
         data class SessionInfoUpdated(val title: String?) : SessionUpdateEvent()
         data class UsageEvent(val used: Long, val size: Long) : SessionUpdateEvent()
         data class Other(val kind: String) : SessionUpdateEvent()
@@ -296,6 +310,16 @@ object AcpModels {
                 if (arr != null && arr.isJsonArray) {
                     val parsed: List<ConfigOption> = internalGson.fromJson(arr, configOptionsListType) ?: emptyList()
                     SessionUpdateEvent.ConfigOptionsUpdated(parsed)
+                } else {
+                    null
+                }
+            }
+            "available_commands_update" -> {
+                val arr = update.get("availableCommands")
+                if (arr != null && arr.isJsonArray) {
+                    val parsed: List<AvailableCommand> =
+                        internalGson.fromJson(arr, availableCommandsListType) ?: emptyList()
+                    SessionUpdateEvent.AvailableCommandsUpdated(parsed)
                 } else {
                     null
                 }

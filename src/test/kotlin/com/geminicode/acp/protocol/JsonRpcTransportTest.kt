@@ -36,14 +36,20 @@ class JsonRpcTransportTest {
                     String line;
                     while ((line = in.readLine()) != null) {
                         if (line.contains("\"method\":\"initialize\"")) {
-                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"authMethods\":[{\"id\":\"oauth-personal\",\"name\":\"Login with Google\"}]}}");
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"auth\":{\"logout\":{}}},\"authMethods\":[{\"id\":\"oauth-personal\",\"name\":\"Login with Google\"}]}}");
                             System.out.flush();
                         } else if (line.contains("\"method\":\"authenticate\"")) {
                             String leakedKey = System.getenv("GEMINI_API_KEY");
                             System.err.println("env_key=" + (leakedKey == null ? "ABSENT" : leakedKey));
                             System.err.println("Visit https://accounts.google.com/o/oauth2/v2/auth?client_id=demo if browser closed");
                             System.err.flush();
-                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}");
+                            String respId = line.contains("\"id\":6") ? "6" : "2";
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":" + respId + ",\"result\":{}}");
+                            System.out.flush();
+                        } else if (line.contains("\"method\":\"logout\"")) {
+                            System.err.println("logged_out_cleanly");
+                            System.err.flush();
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}");
                             System.out.flush();
                         } else if (line.contains("\"method\":\"session/new\"")) {
                             System.out.println("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"sessionId\":\"sess_test_1\"}}");
@@ -121,6 +127,11 @@ class JsonRpcTransportTest {
             assertEquals("fun main() {}", writtenContent.get())
             assertTrue(stderrLines.any { it.contains("env_key=ABSENT") })
             assertTrue(stderrLines.any { it.contains("https://accounts.google.com/o/oauth2/v2/auth") })
+
+            // 验证官方 ACP logout 与重新 authenticate 流程
+            transport.sendRequest("logout", JsonObject(), 30).get(30, TimeUnit.SECONDS)
+            transport.sendRequest("authenticate", AcpModels.AuthenticateParams("oauth-personal"), 30).get(30, TimeUnit.SECONDS)
+            assertTrue(stderrLines.any { it.contains("logged_out_cleanly") })
         } finally {
             transport.close()
         }
