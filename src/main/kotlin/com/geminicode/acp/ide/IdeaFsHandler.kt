@@ -131,7 +131,8 @@ class IdeaFsHandler(private val project: Project) {
     }
 
     private fun ensurePathAuthorized(targetPath: java.nio.file.Path, isWrite: Boolean) {
-        if (IdeaPathSecurity.isWithinWorkspace(project.basePath, targetPath)) return
+        val additionalDirs = GeminiAcpSettingsState.getInstance().getAdditionalDirectories(project.basePath)
+        if (IdeaPathSecurity.isWithinAnyWorkspace(project.basePath, additionalDirs, targetPath)) return
         if (!isWrite && Files.isRegularFile(targetPath)) {
             val allowed = AtomicBoolean(false)
             ApplicationManager.getApplication().invokeAndWait({

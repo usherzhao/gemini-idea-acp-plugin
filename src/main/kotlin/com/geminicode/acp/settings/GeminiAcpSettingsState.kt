@@ -28,8 +28,15 @@ class GeminiAcpSettingsState : PersistentStateComponent<GeminiAcpSettingsState.S
         var proxyUrl: String = "",
         var googleCloudProject: String = "",
         var includeActiveFileByDefault: Boolean = true,
+        var enableEmbeddedContext: Boolean = true,
+        var loadProjectRulesFile: Boolean = true,
+        var systemPromptAppend: String = "",
+        var agySandbox: Boolean = false,
+        var agyDisableTelemetry: Boolean = false,
+        var agyAgentName: String = "",
         var maxAttachedFileChars: Int = 60_000,
-        var customSessionTitles: MutableMap<String, String> = mutableMapOf()
+        var customSessionTitles: MutableMap<String, String> = mutableMapOf(),
+        var projectAdditionalDirectories: MutableMap<String, MutableList<String>> = mutableMapOf()
     )
 
     private var myState = State()
@@ -59,6 +66,33 @@ class GeminiAcpSettingsState : PersistentStateComponent<GeminiAcpSettingsState.S
         return getCustomTitle(sessionId)
             ?: serverTitle?.takeIf { it.isNotBlank() }
             ?: "未命名对话 (${sessionId.take(8)})"
+    }
+
+    fun getAdditionalDirectories(projectBasePath: String?): List<String> {
+        val key = normalizeProjectKey(projectBasePath) ?: return emptyList()
+        return myState.projectAdditionalDirectories[key]
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.distinct()
+            .orEmpty()
+    }
+
+    fun setAdditionalDirectories(projectBasePath: String?, directories: List<String>) {
+        val key = normalizeProjectKey(projectBasePath) ?: return
+        val cleaned = directories.map { it.trim().replace('\\', '/') }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .toMutableList()
+        if (cleaned.isEmpty()) {
+            myState.projectAdditionalDirectories.remove(key)
+        } else {
+            myState.projectAdditionalDirectories[key] = cleaned
+        }
+    }
+
+    private fun normalizeProjectKey(projectBasePath: String?): String? {
+        if (projectBasePath.isNullOrBlank()) return null
+        return projectBasePath.trim().replace('\\', '/').trimEnd('/').lowercase()
     }
 
     companion object {

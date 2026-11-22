@@ -1,9 +1,14 @@
 package com.geminicode.acp.ide
 
+import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ProjectFileIndex
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtilCore
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileVisitor
 import java.nio.file.Paths
 
 /**
@@ -77,6 +82,42 @@ object ProjectFileIndexHelper {
                     matches.add(score to FileCandidate(vFile.name, rel, abs, openInEditor = false))
                 }
                 true
+            }
+
+            // 3. 若配置了官方 ACP additionalDirectories 关联目录，也一并纳入 `@` 模糊搜索范围
+            val extraDirs = GeminiAcpSettingsState.getInstance().getAdditionalDirectories(basePath)
+            if (extraDirs.isNotEmpty() && !isCancelled()) {
+                val maxExtraScan = if (q.isEmpty()) 200 else 6_000
+                var extraScanned = 0
+                val lfs = LocalFileSystem.getInstance()
+                for (dirStr in extraDirs) {
+                    if (isCancelled() || extraScanned > maxExtraScan) break
+                    val dirVFile = lfs.findFileByPath(dirStr) ?: continue
+                    if (!dirVFile.isDirectory) continue
+                    val folderLabel = dirVFile.name
+                    val dirPrefix = dirVFile.path.replace('\\', '/').trimEnd('/') + "/"
+                    VfsUtilCore.visitChildrenRecursively(dirVFile, object : VirtualFileVisitor<Unit>() {
+                        override fun visitFile(file: VirtualFile): Boolean {
+                            if (isCancelled() || extraScanned > maxExtraScan) return false
+                            if (file.isDirectory) {
+                                return file == dirVFile || file.name !in excludedDirs
+                            }
+                            extraScanned++
+                            val abs = file.path.replace('\\', '/')
+                            if (!seenPaths.add(abs.lowercase())) return true
+                            val subRel = if (abs.startsWith(dirPrefix, ignoreCase = true)) {
+                                "$folderLabel/${abs.substring(dirPrefix.length)}"
+                            } else {
+                                "$folderLabel/${file.name}"
+                            }
+                            val score = matchScore(file.name, subRel, q, isOpen = false)
+                            if (score >= 0) {
+                                matches.add(score to FileCandidate(file.name, subRel, abs, openInEditor = false))
+                            }
+                            return true
+                        }
+                    })
+                }
             }
 
             if (isCancelled()) return@compute emptyList()

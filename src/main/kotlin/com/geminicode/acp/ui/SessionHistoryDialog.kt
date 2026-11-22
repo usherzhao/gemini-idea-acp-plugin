@@ -26,7 +26,10 @@ import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.Action
+import javax.swing.AbstractAction
 import javax.swing.DefaultListModel
+import java.awt.event.ActionEvent
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JList
@@ -68,15 +71,34 @@ class SessionHistoryDialog(
     private var allSessions: List<AcpModels.SessionSummary> = emptyList()
     var selectedSession: AcpModels.SessionSummary? = null
         private set
+    var resumeMode: Boolean = false
+        private set
+
+    private val resumeDialogAction = object : AbstractAction("快速续聊 (Resume)") {
+        init {
+            putValue(SHORT_DESCRIPTION, "通过官方 ACP session/resume 秒切上下文（不回放历史消息，适合超长对话）")
+            isEnabled = false
+        }
+
+        override fun actionPerformed(e: ActionEvent?) {
+            if (selectedSession == null) return
+            resumeMode = true
+            doOKAction()
+        }
+    }
 
     init {
         title = "聊天对话历史记录"
-        setOKButtonText("切换到选中对话")
+        setOKButtonText("加载并回放对话")
         setCancelButtonText("关闭")
         init()
         isOKActionEnabled = false
         wireEvents()
         loadSessionsAsync()
+    }
+
+    override fun createActions(): Array<Action> {
+        return arrayOf(okAction, resumeDialogAction, cancelAction)
     }
 
     override fun createCenterPanel(): JComponent {
@@ -114,6 +136,7 @@ class SessionHistoryDialog(
             selectedSession = sessionList.selectedValue
             val hasSelection = selectedSession != null
             isOKActionEnabled = hasSelection
+            resumeDialogAction.isEnabled = hasSelection && acpService.capabilities.sessionResume
             renameButton.isEnabled = hasSelection
         }
         sessionList.addKeyListener(object : KeyAdapter() {
@@ -147,6 +170,23 @@ class SessionHistoryDialog(
         val hasCustom = GeminiAcpSettingsState.getInstance().getCustomTitle(target.sessionId) != null
 
         val popup = JPopupMenu()
+        popup.add(JMenuItem("加载并回放对话 (session/load)").apply {
+            addActionListener {
+                selectedSession = target
+                resumeMode = false
+                doOKAction()
+            }
+        })
+        if (acpService.capabilities.sessionResume) {
+            popup.add(JMenuItem("快速续聊不回放 (session/resume)").apply {
+                addActionListener {
+                    selectedSession = target
+                    resumeMode = true
+                    doOKAction()
+                }
+            })
+        }
+        popup.addSeparator()
         popup.add(JMenuItem("重命名对话...").apply {
             addActionListener { renameSessionItem(target) }
         })
@@ -234,6 +274,7 @@ class SessionHistoryDialog(
         selectedSession = sessionList.selectedValue
         val hasSelection = selectedSession != null
         isOKActionEnabled = hasSelection
+        resumeDialogAction.isEnabled = hasSelection && acpService.capabilities.sessionResume
         renameButton.isEnabled = hasSelection
         statusLabel.text = if (onlyCurrent) {
             "共 ${allSessions.size} 条历史记录，当前项目显示 ${filtered.size} 条（取消勾选可看全部；双击切换，右键/F2 重命名）"

@@ -9,9 +9,12 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import java.awt.BorderLayout
+import java.awt.Dimension
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -30,6 +33,16 @@ class GeminiAcpConfigurable : Configurable {
     private val requireDiffCheck = JBCheckBox("Agent 修改文件前弹出 IDEA 原生 Diff 预览确认")
     private val autoApproveReadCheck = JBCheckBox("自动放行只读工具权限请求（读取文件、搜索等）")
     private val includeActiveFileCheck = JBCheckBox("发送对话时默认附带当前编辑器文件/选区上下文")
+    private val enableEmbeddedContextCheck = JBCheckBox("启用官方 ACP embeddedContext（以标准 resource 块随请求传递已引用文件/行区间内容）")
+    private val loadProjectRulesCheck = JBCheckBox("自动读取项目根目录 .gemini/rules.md 并通过官方 systemPrompt.append 注入")
+    private val agySandboxCheck = JBCheckBox("启用 Antigravity 终端沙盒限制（agy acp --sandbox）")
+    private val agyDisableTelemetryCheck = JBCheckBox("禁用 Antigravity CLI 遥测上报（agy acp --disable-telemetry）")
+    private val agyAgentField = JBTextField()
+    private val systemPromptArea = JBTextArea(3, 40).apply {
+        lineWrap = true
+        wrapStyleWord = true
+        emptyText.text = "可选：追加到官方 _meta.antigravity.systemPrompt.append 的全局开发规范（如语言、代码风格等）"
+    }
     private val proxyField = JBTextField()
     private val gcpProjectField = JBTextField()
     private val detectStatusLabel = JBLabel()
@@ -40,6 +53,7 @@ class GeminiAcpConfigurable : Configurable {
             .withDescription("留空则自动优先探测 agy.exe (Antigravity ACP)，其次探测 gemini CLI")
         executableField.addBrowseFolderListener(null, descriptor)
         (executableField.textField as? JBTextField)?.emptyText?.text = "留空则自动优先探测 agy (Antigravity CLI)，其次 gemini"
+        agyAgentField.emptyText.text = "可选：指定 agy acp --agent 名称，留空使用默认 Agent"
         proxyField.emptyText.text = "可选，例如 http://127.0.0.1:7890"
         gcpProjectField.emptyText.text = "可选，仅企业/GCP 项目需要时填写 GOOGLE_CLOUD_PROJECT"
     }
@@ -54,6 +68,9 @@ class GeminiAcpConfigurable : Configurable {
             add(detectButton, BorderLayout.WEST)
             add(detectStatusLabel, BorderLayout.CENTER)
         }
+        val promptScroll = JBScrollPane(systemPromptArea).apply {
+            preferredSize = Dimension(420, 72)
+        }
 
         rootPanel = FormBuilder.createFormBuilder()
             .addLabeledComponent("CLI 路径 (推荐 agy):", executableField, 1, false)
@@ -65,6 +82,14 @@ class GeminiAcpConfigurable : Configurable {
             .addComponent(requireDiffCheck, 1)
             .addComponent(autoApproveReadCheck, 1)
             .addComponent(includeActiveFileCheck, 1)
+            .addComponent(enableEmbeddedContextCheck, 1)
+            .addSeparator(8)
+            .addComponent(loadProjectRulesCheck, 1)
+            .addLabeledComponent("追加系统提示词 (systemPrompt.append):", promptScroll, 1, true)
+            .addSeparator(8)
+            .addComponent(agySandboxCheck, 1)
+            .addComponent(agyDisableTelemetryCheck, 1)
+            .addLabeledComponent("指定 Agent (--agent, 可选):", agyAgentField, 1, false)
             .addSeparator(8)
             .addLabeledComponent("代理地址 (HTTP/HTTPS_PROXY):", proxyField, 1, false)
             .addLabeledComponent("GCP 项目 ID (可选):", gcpProjectField, 1, false)
@@ -117,6 +142,12 @@ class GeminiAcpConfigurable : Configurable {
             requireDiffCheck.isSelected != state.requireDiffBeforeWrite ||
             autoApproveReadCheck.isSelected != state.autoApproveReadTools ||
             includeActiveFileCheck.isSelected != state.includeActiveFileByDefault ||
+            enableEmbeddedContextCheck.isSelected != state.enableEmbeddedContext ||
+            loadProjectRulesCheck.isSelected != state.loadProjectRulesFile ||
+            systemPromptArea.text.trim() != state.systemPromptAppend ||
+            agySandboxCheck.isSelected != state.agySandbox ||
+            agyDisableTelemetryCheck.isSelected != state.agyDisableTelemetry ||
+            agyAgentField.text.trim() != state.agyAgentName ||
             proxyField.text.trim() != state.proxyUrl ||
             gcpProjectField.text.trim() != state.googleCloudProject
     }
@@ -131,6 +162,12 @@ class GeminiAcpConfigurable : Configurable {
         state.requireDiffBeforeWrite = requireDiffCheck.isSelected
         state.autoApproveReadTools = autoApproveReadCheck.isSelected
         state.includeActiveFileByDefault = includeActiveFileCheck.isSelected
+        state.enableEmbeddedContext = enableEmbeddedContextCheck.isSelected
+        state.loadProjectRulesFile = loadProjectRulesCheck.isSelected
+        state.systemPromptAppend = systemPromptArea.text.trim()
+        state.agySandbox = agySandboxCheck.isSelected
+        state.agyDisableTelemetry = agyDisableTelemetryCheck.isSelected
+        state.agyAgentName = agyAgentField.text.trim()
         state.proxyUrl = proxyField.text.trim()
         state.googleCloudProject = gcpProjectField.text.trim()
 
@@ -151,6 +188,12 @@ class GeminiAcpConfigurable : Configurable {
         requireDiffCheck.isSelected = state.requireDiffBeforeWrite
         autoApproveReadCheck.isSelected = state.autoApproveReadTools
         includeActiveFileCheck.isSelected = state.includeActiveFileByDefault
+        enableEmbeddedContextCheck.isSelected = state.enableEmbeddedContext
+        loadProjectRulesCheck.isSelected = state.loadProjectRulesFile
+        systemPromptArea.text = state.systemPromptAppend
+        agySandboxCheck.isSelected = state.agySandbox
+        agyDisableTelemetryCheck.isSelected = state.agyDisableTelemetry
+        agyAgentField.text = state.agyAgentName
         proxyField.text = state.proxyUrl
         gcpProjectField.text = state.googleCloudProject
     }

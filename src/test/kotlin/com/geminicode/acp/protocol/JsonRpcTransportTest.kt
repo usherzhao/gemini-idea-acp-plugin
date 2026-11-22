@@ -36,20 +36,30 @@ class JsonRpcTransportTest {
                     String line;
                     while ((line = in.readLine()) != null) {
                         if (line.contains("\"method\":\"initialize\"")) {
-                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"auth\":{\"logout\":{}}},\"authMethods\":[{\"id\":\"oauth-personal\",\"name\":\"Login with Google\"}]}}");
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"promptCapabilities\":{\"image\":true,\"embeddedContext\":true},\"sessionCapabilities\":{\"close\":{},\"resume\":{},\"additionalDirectories\":{}},\"auth\":{\"logout\":{}}},\"authMethods\":[{\"id\":\"oauth-personal\",\"name\":\"Login with Google\"}]}}");
                             System.out.flush();
                         } else if (line.contains("\"method\":\"authenticate\"")) {
                             String leakedKey = System.getenv("GEMINI_API_KEY");
                             System.err.println("env_key=" + (leakedKey == null ? "ABSENT" : leakedKey));
                             System.err.println("Visit https://accounts.google.com/o/oauth2/v2/auth?client_id=demo if browser closed");
                             System.err.flush();
-                            String respId = line.contains("\"id\":6") ? "6" : "2";
+                            String respId = line.contains("\"id\":8") ? "8" : "2";
                             System.out.println("{\"jsonrpc\":\"2.0\",\"id\":" + respId + ",\"result\":{}}");
+                            System.out.flush();
+                        } else if (line.contains("\"method\":\"session/close\"")) {
+                            System.err.println("session_closed");
+                            System.err.flush();
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}");
+                            System.out.flush();
+                        } else if (line.contains("\"method\":\"session/resume\"")) {
+                            System.err.println("session_resumed");
+                            System.err.flush();
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"sessionId\":\"sess_test_1\"}}");
                             System.out.flush();
                         } else if (line.contains("\"method\":\"logout\"")) {
                             System.err.println("logged_out_cleanly");
                             System.err.flush();
-                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}");
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}");
                             System.out.flush();
                         } else if (line.contains("\"method\":\"session/new\"")) {
                             System.out.println("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"sessionId\":\"sess_test_1\"}}");
@@ -128,9 +138,15 @@ class JsonRpcTransportTest {
             assertTrue(stderrLines.any { it.contains("env_key=ABSENT") })
             assertTrue(stderrLines.any { it.contains("https://accounts.google.com/o/oauth2/v2/auth") })
 
-            // 验证官方 ACP logout 与重新 authenticate 流程
+            // 验证官方 ACP session/close、session/resume、logout 与重新 authenticate 流程
+            transport.sendRequest("session/close", AcpModels.CloseSessionParams("sess_test_1"), 30).get(30, TimeUnit.SECONDS)
+            val resumeParams = AcpModels.buildSessionTargetParamsJson("sess_test_1", workDir.absolutePath, listOf(workDir.absolutePath))
+            val resumed = transport.sendRequest("session/resume", resumeParams, 30).get(30, TimeUnit.SECONDS).asJsonObject
+            assertEquals("sess_test_1", resumed.get("sessionId").asString)
             transport.sendRequest("logout", JsonObject(), 30).get(30, TimeUnit.SECONDS)
             transport.sendRequest("authenticate", AcpModels.AuthenticateParams("oauth-personal"), 30).get(30, TimeUnit.SECONDS)
+            assertTrue(stderrLines.any { it.contains("session_closed") })
+            assertTrue(stderrLines.any { it.contains("session_resumed") })
             assertTrue(stderrLines.any { it.contains("logged_out_cleanly") })
         } finally {
             transport.close()

@@ -327,4 +327,77 @@ class AcpProtocolSerializationTest {
         val v2Init = gson.fromJson(v2InitJson, AcpModels.InitializeResult::class.java)
         assertTrue(v2Init.supportsLogout())
     }
+
+    @Test
+    fun `initialize parses full Antigravity ACP 1_5 capabilities and builders emit clean JSON without nulls`() {
+        val fullInitJson = """
+            {
+              "protocolVersion": 1,
+              "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true },
+                "sessionCapabilities": { "resume": {}, "close": {}, "load": {}, "list": {}, "additionalDirectories": {} },
+                "auth": { "logout": {} },
+                "_meta": { "antigravity": { "tier": true, "systemPrompt": { "append": true } } }
+              },
+              "authMethods": [
+                { "id": "oauth-personal", "name": "Log in with Google" }
+              ]
+            }
+        """.trimIndent()
+        val parsed = gson.fromJson(fullInitJson, AcpModels.InitializeResult::class.java)
+        val caps = parsed.parseCapabilities()
+        assertTrue(caps.loadSession)
+        assertTrue(caps.promptImage)
+        assertFalse(caps.promptAudio)
+        assertTrue(caps.promptEmbeddedContext)
+        assertTrue(caps.sessionList)
+        assertTrue(caps.sessionLoad)
+        assertTrue(caps.sessionResume)
+        assertTrue(caps.sessionClose)
+        assertTrue(caps.additionalDirectories)
+        assertTrue(caps.authLogout)
+        assertTrue(caps.antigravityTier)
+        assertTrue(caps.antigravitySystemPromptAppend)
+
+        // 可选字段为空时不输出 additionalDirectories / _meta
+        val minimalNew = AcpModels.buildNewSessionParamsJson("D:/repo")
+        assertFalse(minimalNew.has("additionalDirectories"))
+        assertFalse(minimalNew.has("_meta"))
+
+        // 传入 additionalDirectories 与 systemPrompt.append 时按官方结构序列化
+        val fullNew = AcpModels.buildNewSessionParamsJson(
+            cwd = "D:/repo",
+            additionalDirectories = listOf("D:/shared", "D:/shared"),
+            systemPromptAppend = "Use Chinese comments"
+        )
+        assertEquals(1, fullNew.getAsJsonArray("additionalDirectories").size())
+        assertEquals("D:/shared", fullNew.getAsJsonArray("additionalDirectories")[0].asString)
+        assertEquals(
+            "Use Chinese comments",
+            fullNew.getAsJsonObject("_meta").getAsJsonObject("antigravity").getAsJsonObject("systemPrompt").get("append").asString
+        )
+
+        // 多模态 PromptBlock：Text + EmbeddedResource + Image
+        val promptObj = AcpModels.buildPromptParamsJson(
+            sessionId = "s1",
+            blocks = listOf(
+                AcpModels.PromptBlock.Text("分析这张图和代码"),
+                AcpModels.PromptBlock.EmbeddedResource("file:///D:/repo/App.kt#L1-L5", "text/x-kotlin", "fun main() {}"),
+                AcpModels.PromptBlock.Image("iVBORw0KGgo=", "image/png")
+            )
+        )
+        val arr = promptObj.getAsJsonArray("prompt")
+        assertEquals(3, arr.size())
+        assertEquals("text", arr[0].asJsonObject.get("type").asString)
+        assertFalse(arr[0].asJsonObject.has("data"))
+        assertEquals("resource", arr[1].asJsonObject.get("type").asString)
+        assertEquals("file:///D:/repo/App.kt#L1-L5", arr[1].asJsonObject.getAsJsonObject("resource").get("uri").asString)
+        assertEquals("image", arr[2].asJsonObject.get("type").asString)
+        assertEquals("image/png", arr[2].asJsonObject.get("mimeType").asString)
+
+        // Usage 格式化
+        assertEquals("上下文 18.4k / 1.0M (1.8%)", AcpModels.formatUsageSummary(18_400, 1_000_000))
+        assertEquals("已用 512 tokens", AcpModels.formatUsageSummary(512, 0))
+    }
 }

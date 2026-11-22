@@ -11,6 +11,12 @@
   - 在左侧项目文件树、编辑器标签页或顶部导航栏 **右键单选/多选文件或目录 → 引用文件到 Gemini 对话框**，直接将 `@文件名` 引用带入对话框；
   - 输入 **`/`** 模糊搜索并选择系统已安装的 Skills 与官方斜杠命令列表（自动合并 ACP `available_commands_update` 与本地 `SKILL.md`）；
   - 在编辑器中选中单行或多行后 **右键 → Gemini 对话编程助手 → 引用选中行/当前行到 Gemini 对话框**，仅传递文件路径与起止行号（不粘贴整段源码）。
+- **官方 `agy acp` 全套能力集成**：
+  - **多模态图片输入（`promptCapabilities.image`）**：支持在对话框 `Ctrl+V` 直接粘贴剪贴板截图、拖拽图片或点击 `🖼️ 图片` 按钮多图提问；
+  - **官方结构化嵌入上下文（`promptCapabilities.embeddedContext`）**：对话框保持精简 `@文件名#L起-L止`，后台按标准 ACP `resource` 块自动传递引用内容（含未保存编辑器内容，可在设置中开关）；
+  - **多目录跨项目工作区（`sessionCapabilities.additionalDirectories`）**：顶部点击 **「关联目录」** 挂载多个外部微服务/前端目录，自动热同步至当前会话并纳入 `@` 模糊搜索与本地文件安全白名单；
+  - **会话全生命周期与实时用量**：完整支持 `session/list`、`session/load`（回放历史）、`session/resume`（快速续聊）、`session/close`（切会话/关项目自动释放服务端资源）及 `usage_update` 实时上下文 Token 占用显示；
+  - **系统提示词追加与高级 CLI 选项**：支持 `_meta.antigravity.systemPrompt.append`（设置页全局提示词 + 自动加载项目 `.gemini/rules.md`）以及官方 `--sandbox`、`--disable-telemetry`、`--agent` 启动选项。
 - **原生 IDEA Diff 预览确认**：Agent 通过 ACP `fs/write_text_file` 修改或新建文件前，会弹出 IntelliJ IDEA 原生语法高亮 **Diff 对比弹窗**；确认后通过 `WriteCommandAction` 写入（支持 `Ctrl+Z` 撤销与 VFS 同步）。
 - **内置诊断日志与工作区保护**：侧边栏内置可折叠「日志」面板查看实时 CLI/ACP 输出，并拦截越权访问项目根目录之外的文件。
 
@@ -30,7 +36,7 @@
 ## 安装到 IntelliJ IDEA
 
 1. 打开 **`设置 (Settings) -> 插件 (Plugins) -> ⚙️ -> 从磁盘安装插件... (Install Plugin from Disk...)`**。
-2. 选择 `build/distributions/gemini-idea-acp-plugin-1.0.10.zip`，点击 **确定 (OK)**（若界面提示重启 IDE，请务必点击 **重启 IDE** 让插件生效）。
+2. 选择 `build/distributions/gemini-idea-acp-plugin-1.1.0.zip`，点击 **确定 (OK)**（若界面提示重启 IDE，请务必点击 **重启 IDE** 让插件生效）。
 3. 打开右侧边栏 **`Gemini 助手`** 工具窗口：
    - 插件将自动优先探测本地 **Antigravity CLI (`agy acp`)**，点击 **`登录/连接`** 即可复用或完成个人 Google 账号登录；
    - 需要更换 Google 账号或重新授权时，点击顶部 **`切换账号`** 即可通过官方 ACP `logout` 退出当前账号并重新拉起登录（也支持选择「仅退出登录」）；

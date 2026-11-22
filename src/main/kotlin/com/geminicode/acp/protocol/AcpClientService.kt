@@ -1,6 +1,8 @@
 package com.geminicode.acp.protocol
 
+import com.geminicode.acp.ide.AcpContextBuilder
 import com.geminicode.acp.ide.IdeaFsHandler
+import com.geminicode.acp.ide.ImageAttachmentHelper
 import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.geminicode.acp.settings.GeminiExecutableResolver
 import com.google.gson.Gson
@@ -35,12 +37,14 @@ class AcpClientService(private val project: Project) : Disposable {
 
     interface AcpEventListener {
         fun onStateChanged(state: ConnectionState, detail: String) {}
+        fun onCapabilitiesUpdated(capabilities: AcpModels.AgentCapabilitiesSummary) {}
         fun onSessionMetadataChanged(metadata: AcpModels.SessionMetadata) {}
         fun onAvailableCommandsChanged(commands: List<AcpModels.AvailableCommand>) {}
         fun onSessionTitleChanged(title: String) {}
         fun onSessionLoadingStarted(session: AcpModels.SessionSummary) {}
         fun onSessionLoadingFinished(metadata: AcpModels.SessionMetadata?, errorMessage: String?) {}
         fun onSessionUpdate(event: AcpModels.SessionUpdateEvent, isReplay: Boolean) {}
+        fun onUsageUpdated(usage: AcpModels.SessionUpdateEvent.UsageEvent?) {}
         fun onTurnFinished(stopReason: String?) {}
         fun onLoggedOut() {}
         fun onAuthUrlDetected(url: String) {}
@@ -85,6 +89,10 @@ class AcpClientService(private val project: Project) : Disposable {
         private set
 
     @Volatile
+    var capabilities: AcpModels.AgentCapabilitiesSummary = AcpModels.AgentCapabilitiesSummary()
+        private set
+
+    @Volatile
     var supportsLogout: Boolean = false
         private set
 
@@ -94,6 +102,10 @@ class AcpClientService(private val project: Project) : Disposable {
 
     @Volatile
     var availableCommands: List<AcpModels.AvailableCommand> = emptyList()
+        private set
+
+    @Volatile
+    var lastUsage: AcpModels.SessionUpdateEvent.UsageEvent? = null
         private set
 
     private val urlRegex = Regex("""https://accounts\.google\.com/[^\s"'<>]+""")
@@ -154,7 +166,9 @@ class AcpClientService(private val project: Project) : Disposable {
             if (currentTransport == null || !currentTransport.isAlive()) {
                 return@supplyAsync connectAndAuthenticateBlocking()
             }
+            closeActiveSessionBestEffort(currentTransport)
             fsHandler.clearSessionAllowances()
+            clearUsage()
             val session = createSession(currentTransport)
             activeServerSessionTitle = null
             activeSessionTitle = "新对话"
@@ -243,29 +257,87 @@ class AcpClientService(private val project: Project) : Disposable {
      * 通过官方 ACP `session/load` 切换到指定历史会话并回放完整历史对话上下文。
      */
     fun loadSession(session: AcpModels.SessionSummary): CompletableFuture<AcpModels.SessionMetadata> {
+        return switchToHistoricalSession(session, useResume = false)
+    }
+
+    /**
+     * 通过官方 ACP `session/resume` 快速续聊指定历史会话（不回放历史消息，适合超长对话秒切）。
+     */
+    fun resumeSession(session: AcpModels.SessionSummary): CompletableFuture<AcpModels.SessionMetadata> {
+        return switchToHistoricalSession(session, useResume = true)
+    }
+
+    /**
+     * 保存并热应用当前项目的官方 ACP `additionalDirectories` 关联目录配置。
+     */
+    fun applyAdditionalDirectories(directories: List<String>): CompletableFuture<Boolean> {
+        GeminiAcpSettingsState.getInstance().setAdditionalDirectories(project.basePath, directories)
+        return CompletableFuture.supplyAsync({
+            val activeTransport = transport
+            val sid = activeSessionId
+            if (activeTransport != null && activeTransport.isAlive() && sid != null &&
+                capabilities.sessionResume && capabilities.additionalDirectories
+            ) {
+                val cwd = project.basePath ?: System.getProperty("user.home")
+                val params = AcpModels.buildSessionTargetParamsJson(
+                    sessionId = sid,
+                    cwd = cwd,
+                    additionalDirectories = resolveConfiguredAdditionalDirs(),
+                    systemPromptAppend = resolveConfiguredSystemPromptAppend()
+                )
+                runCatching {
+                    val resJson = activeTransport.sendRequest("session/resume", params, timeoutSeconds = 30).get()
+                    val resumed = gson.fromJson(resJson, AcpModels.NewSessionResult::class.java)
+                    if (resumed != null) {
+                        publishSession(resumed, lastMetadata?.tierName)
+                    }
+                    notifyLog("已通过官方 ACP session/resume 热更新关联目录 (${directories.size} 个)")
+                    return@supplyAsync true
+                }.onFailure { err ->
+                    notifyLog("关联目录已保存，将在下次新建对话或重连时生效（热同步跳过：${unwrapCause(err).message}）")
+                }
+            } else {
+                notifyLog("已更新关联目录 (${directories.size} 个)，将在连接或新建会话时通过 additionalDirectories 传入")
+            }
+            false
+        }, lifecycleExecutor)
+    }
+
+    private fun switchToHistoricalSession(
+        session: AcpModels.SessionSummary,
+        useResume: Boolean
+    ): CompletableFuture<AcpModels.SessionMetadata> {
         return CompletableFuture.supplyAsync({
             val activeTransport = ensureConnectedTransportOnLifecycleThread()
+            if (activeSessionId != null && activeSessionId != session.sessionId) {
+                closeActiveSessionBestEffort(activeTransport)
+            }
             fsHandler.clearSessionAllowances()
+            clearUsage()
             val targetCwd = SessionPathUtil.resolveLoadCwd(session.cwd, project.basePath)
             val displayTitle = GeminiAcpSettingsState.getInstance()
                 .resolveDisplayTitle(session.sessionId, session.title)
+            val method = if (useResume && capabilities.sessionResume) "session/resume" else "session/load"
+            val actionLabel = if (method == "session/resume") "正在快速续聊历史对话" else "正在加载历史对话"
 
-            updateState(ConnectionState.CONNECTING, "正在加载历史对话：$displayTitle ...")
-            replayingHistory.set(true)
+            updateState(ConnectionState.CONNECTING, "$actionLabel：$displayTitle ...")
+            replayingHistory.set(method == "session/load")
             listeners.forEach { it.onSessionLoadingStarted(session) }
 
             try {
+                val params = AcpModels.buildSessionTargetParamsJson(
+                    sessionId = session.sessionId,
+                    cwd = targetCwd,
+                    additionalDirectories = resolveConfiguredAdditionalDirs(),
+                    systemPromptAppend = resolveConfiguredSystemPromptAppend()
+                )
                 val resultJson = activeTransport.sendRequest(
-                    "session/load",
-                    AcpModels.LoadSessionParams(
-                        sessionId = session.sessionId,
-                        cwd = targetCwd,
-                        mcpServers = emptyList()
-                    ),
+                    method,
+                    params,
                     timeoutSeconds = 60
                 ).get()
                 val loaded = gson.fromJson(resultJson, AcpModels.NewSessionResult::class.java)
-                    ?: throw IllegalStateException("session/load 返回空结果")
+                    ?: throw IllegalStateException("$method 返回空结果")
                 replayingHistory.set(false)
                 activeServerSessionTitle = session.title
                 activeSessionTitle = displayTitle
@@ -274,12 +346,12 @@ class AcpClientService(private val project: Project) : Disposable {
                 val authMode = GeminiAcpSettingsState.getInstance().state.authMethodId
                 updateState(ConnectionState.READY, formatReadyDetail(authMode, meta.tierName))
                 listeners.forEach { it.onSessionLoadingFinished(meta, null) }
-                notifyLog("已切换到历史对话：${session.sessionId} ($displayTitle)")
+                notifyLog("已通过 $method 切换到历史对话：${session.sessionId} ($displayTitle)")
                 meta
             } catch (t: Throwable) {
                 replayingHistory.set(false)
                 val root = unwrapCause(t)
-                val msg = root.message ?: "加载历史会话失败"
+                val msg = root.message ?: "切换历史会话失败"
                 val authMode = GeminiAcpSettingsState.getInstance().state.authMethodId
                 updateState(ConnectionState.READY, formatReadyDetail(authMode, lastMetadata?.tierName))
                 listeners.forEach { it.onSessionLoadingFinished(null, msg) }
@@ -330,20 +402,41 @@ class AcpClientService(private val project: Project) : Disposable {
         }, lifecycleExecutor)
     }
 
-    fun sendPrompt(promptText: String): CompletableFuture<String?> {
-        if (promptText.isBlank()) {
+    fun sendPrompt(promptText: String): CompletableFuture<String?> =
+        sendPrompt(promptText, emptyList(), emptyList())
+
+    fun sendPrompt(
+        promptText: String,
+        images: List<ImageAttachmentHelper.ImageAttachment>,
+        embeddedResources: List<AcpModels.PromptBlock.EmbeddedResource>
+    ): CompletableFuture<String?> {
+        if (promptText.isBlank() && images.isEmpty()) {
             return CompletableFuture.completedFuture(null)
         }
         return CompletableFuture.supplyAsync({
             val activeTransport = ensureConnectedTransportOnLifecycleThread()
             val sid = activeSessionId ?: createSession(activeTransport).also { publishSession(it, lastMetadata?.tierName) }.sessionId
 
+            if (images.isNotEmpty() && !capabilities.promptImage) {
+                throw IllegalStateException("当前 ACP 后端未声明图片多模态能力 (promptCapabilities.image)，请移除图片后重试或使用 Antigravity CLI (agy acp)。")
+            }
+
+            val blocks = mutableListOf<AcpModels.PromptBlock>()
+            if (promptText.isNotBlank()) {
+                blocks.add(AcpModels.PromptBlock.Text(promptText))
+            }
+            if (capabilities.promptEmbeddedContext && embeddedResources.isNotEmpty()) {
+                blocks.addAll(embeddedResources)
+            }
+            if (capabilities.promptImage && images.isNotEmpty()) {
+                images.forEach { img ->
+                    blocks.add(AcpModels.PromptBlock.Image(data = img.base64Data, mimeType = img.mimeType))
+                }
+            }
+
             updateState(ConnectionState.STREAMING, "正在思考并生成响应...")
             try {
-                val params = AcpModels.PromptParams(
-                    sessionId = sid,
-                    prompt = listOf(AcpModels.ContentBlock(type = "text", text = promptText))
-                )
+                val params = AcpModels.buildPromptParamsJson(sid, blocks)
                 val resultJson = activeTransport.sendRequest("session/prompt", params, timeoutSeconds = 300).get()
                 val result = gson.fromJson(resultJson, AcpModels.PromptResult::class.java)
                 val authMode = GeminiAcpSettingsState.getInstance().state.authMethodId
@@ -369,6 +462,8 @@ class AcpClientService(private val project: Project) : Disposable {
 
     fun disconnect() {
         lifecycleExecutor.submit {
+            closeActiveSessionBestEffort(transport)
+            clearUsage()
             disconnectInternal()
             updateState(ConnectionState.DISCONNECTED, "未连接")
         }
@@ -441,6 +536,7 @@ class AcpClientService(private val project: Project) : Disposable {
             return false
         }
 
+        closeActiveSessionBestEffort(activeTransport)
         updateState(ConnectionState.AUTHENTICATING, "正在通过官方 ACP 退出当前账号...")
         try {
             activeTransport.sendRequest("logout", JsonObject(), timeoutSeconds = 30).get()
@@ -495,7 +591,8 @@ class AcpClientService(private val project: Project) : Disposable {
             GeminiExecutableResolver.BackendKind.GEMINI_CLI -> "正在启动 Gemini CLI ($acpFlag)..."
         }
         updateState(ConnectionState.CONNECTING, launchHint)
-        val cmd = buildCommand(resolved, acpFlag)
+        val extraDirs = GeminiAcpSettingsState.getInstance().getAdditionalDirectories(project.basePath)
+        val cmd = buildCommand(resolved, acpFlag, settings, extraDirs)
         notifyLog("启动命令: ${cmd.joinToString(" ")}")
 
         val env = buildProcessEnv(settings)
@@ -539,6 +636,10 @@ class AcpClientService(private val project: Project) : Disposable {
                                     }
                                 }
                             }
+                            is AcpModels.SessionUpdateEvent.UsageEvent -> {
+                                lastUsage = ev
+                                listeners.forEach { it.onUsageUpdated(ev) }
+                            }
                             else -> Unit
                         }
                         val isReplay = replayingHistory.get()
@@ -571,10 +672,19 @@ class AcpClientService(private val project: Project) : Disposable {
         val initJson = newTransport.sendRequest("initialize", AcpModels.InitializeParams(), timeoutSeconds = initTimeoutSec).get()
         val initResult = gson.fromJson(initJson, AcpModels.InitializeResult::class.java)
         availableAuthMethods = initResult?.authMethods.orEmpty()
-        supportsLogout = initResult?.supportsLogout() == true
+        val parsedCaps = initResult?.parseCapabilities() ?: AcpModels.AgentCapabilitiesSummary()
+        capabilities = parsedCaps
+        supportsLogout = parsedCaps.authLogout
+        listeners.forEach { it.onCapabilitiesUpdated(parsedCaps) }
         val agentName = initResult?.agentInfo?.get("name")?.takeIf { it.isJsonPrimitive }?.asString ?: "ACP Server"
         val agentVer = initResult?.agentInfo?.get("version")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
-        notifyLog("ACP 初始化成功 ($agentName $agentVer)，支持认证方式: ${availableAuthMethods.joinToString { it.id }}，支持切换账号(logout): $supportsLogout")
+        notifyLog(
+            "ACP 初始化成功 ($agentName $agentVer) | 认证方式: ${availableAuthMethods.joinToString { it.id }} | " +
+                "能力: image=${parsedCaps.promptImage}, embeddedContext=${parsedCaps.promptEmbeddedContext}, " +
+                "resume=${parsedCaps.sessionResume}, close=${parsedCaps.sessionClose}, " +
+                "additionalDirs=${parsedCaps.additionalDirectories}, logout=${parsedCaps.authLogout}, " +
+                "systemPromptAppend=${parsedCaps.antigravitySystemPromptAppend}"
+        )
         return newTransport to initResult
     }
 
@@ -591,6 +701,7 @@ class AcpClientService(private val project: Project) : Disposable {
         val authTier = AcpModels.extractTierName(authResult)
         notifyLog("$chosenAuth 认证成功" + (authTier?.let { " ($it)" } ?: ""))
 
+        clearUsage()
         val session = createSession(newTransport)
         activeServerSessionTitle = null
         activeSessionTitle = "新对话"
@@ -602,13 +713,51 @@ class AcpClientService(private val project: Project) : Disposable {
 
     private fun createSession(activeTransport: JsonRpcTransport): AcpModels.NewSessionResult {
         val cwd = project.basePath ?: System.getProperty("user.home")
+        val params = AcpModels.buildNewSessionParamsJson(
+            cwd = cwd,
+            additionalDirectories = resolveConfiguredAdditionalDirs(),
+            systemPromptAppend = resolveConfiguredSystemPromptAppend()
+        )
         val sessionJson = activeTransport.sendRequest(
             "session/new",
-            AcpModels.NewSessionParams(cwd = cwd, mcpServers = emptyList()),
+            params,
             timeoutSeconds = 45
         ).get()
         return gson.fromJson(sessionJson, AcpModels.NewSessionResult::class.java)
             ?: throw IllegalStateException("session/new 返回空结果")
+    }
+
+    private fun resolveConfiguredAdditionalDirs(): List<String> {
+        if (!capabilities.additionalDirectories) return emptyList()
+        return GeminiAcpSettingsState.getInstance()
+            .getAdditionalDirectories(project.basePath)
+            .filter { File(it).isDirectory }
+    }
+
+    private fun resolveConfiguredSystemPromptAppend(): String? {
+        if (!capabilities.antigravitySystemPromptAppend) return null
+        val state = GeminiAcpSettingsState.getInstance().state
+        return AcpContextBuilder.resolveSystemPromptAppend(
+            projectBasePath = project.basePath,
+            globalSystemPrompt = state.systemPromptAppend,
+            loadProjectRulesFile = state.loadProjectRulesFile
+        )
+    }
+
+    private fun closeActiveSessionBestEffort(activeTransport: JsonRpcTransport?) {
+        val sid = activeSessionId ?: return
+        if (activeTransport == null || !activeTransport.isAlive() || !capabilities.sessionClose) return
+        runCatching {
+            activeTransport.sendRequest("session/close", AcpModels.CloseSessionParams(sid), timeoutSeconds = 5).get()
+            notifyLog("已通过官方 ACP session/close 释放会话资源: ${sid.take(8)}")
+        }.onFailure { err ->
+            notifyLog("关闭旧会话跳过 (${sid.take(8)}): ${unwrapCause(err).message}")
+        }
+    }
+
+    private fun clearUsage() {
+        lastUsage = null
+        listeners.forEach { it.onUsageUpdated(null) }
     }
 
     private fun publishSession(session: AcpModels.NewSessionResult, fallbackTier: String?): AcpModels.SessionMetadata {
@@ -666,15 +815,35 @@ class AcpClientService(private val project: Project) : Disposable {
 
     internal fun buildCommand(
         resolved: GeminiExecutableResolver.ResolutionResult,
-        acpFlag: String
+        acpFlag: String,
+        settings: GeminiAcpSettingsState.State = GeminiAcpSettingsState.State(),
+        additionalDirectories: List<String> = emptyList()
     ): List<String> {
         val exe = resolved.executablePath!!
         if (resolved.backendKind == GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY) {
-            return if (resolved.needsCmdWrapper) {
-                listOf("cmd.exe", "/c", "call", exe, "acp")
+            val base = if (resolved.needsCmdWrapper) {
+                mutableListOf("cmd.exe", "/c", "call", exe, "acp")
             } else {
-                listOf(exe, "acp")
+                mutableListOf(exe, "acp")
             }
+            if (settings.agySandbox) {
+                base.add("--sandbox")
+            }
+            if (settings.agyDisableTelemetry) {
+                base.add("--disable-telemetry")
+            }
+            if (settings.agyAgentName.isNotBlank()) {
+                base.add("--agent")
+                base.add(settings.agyAgentName.trim())
+            }
+            additionalDirectories.map { it.trim() }
+                .filter { it.isNotEmpty() && File(it).isDirectory }
+                .distinct()
+                .forEach { dir ->
+                    base.add("--add-dir")
+                    base.add(dir)
+                }
+            return base
         }
         if (resolved.directNodePath != null && resolved.directScriptPath != null) {
             return listOf(resolved.directNodePath, resolved.directScriptPath, acpFlag)
@@ -709,6 +878,7 @@ class AcpClientService(private val project: Project) : Disposable {
     private fun clearAuthAndDisconnectInternal() {
         lastMetadata = null
         availableCommands = emptyList()
+        clearUsage()
         fsHandler.clearSessionAllowances()
         disconnectInternal()
     }
@@ -741,6 +911,7 @@ class AcpClientService(private val project: Project) : Disposable {
     }
 
     override fun dispose() {
+        closeActiveSessionBestEffort(transport)
         disconnectInternal()
         lifecycleExecutor.shutdownNow()
     }

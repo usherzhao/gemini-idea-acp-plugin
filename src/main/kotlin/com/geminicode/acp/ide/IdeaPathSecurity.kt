@@ -25,6 +25,24 @@ object IdeaPathSecurity {
     }
 
     /**
+     * 检查目标路径是否位于主工作区或官方 ACP `additionalDirectories` 白名单目录内。
+     */
+    fun isWithinAnyWorkspace(
+        projectBasePath: String?,
+        additionalDirectories: List<String>,
+        candidate: Path
+    ): Boolean {
+        val normCandidate = candidate.toAbsolutePath().normalize()
+        if (isWithinWorkspace(projectBasePath, normCandidate)) return true
+        for (dir in additionalDirectories) {
+            if (dir.isBlank()) continue
+            val root = runCatching { Paths.get(dir.trim()).toAbsolutePath().normalize() }.getOrNull() ?: continue
+            if (normCandidate.startsWith(root)) return true
+        }
+        return false
+    }
+
+    /**
      * Slices text by 1-based [startLine] and optional max [limit] lines per ACP fs/read_text_file spec.
      */
     fun sliceLines(content: String, startLine: Int?, limit: Int?): String {

@@ -1,9 +1,11 @@
 package com.geminicode.acp.protocol
 
 import com.google.gson.Gson
+import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.reflect.TypeToken
+import java.util.Locale
 
 /**
  * Agent Client Protocol (ACP) JSON-RPC 2.0 请求、响应与流式事件模型。
@@ -16,7 +18,7 @@ object AcpModels {
 
     data class ClientInfo(
         val name: String = "gemini-idea-acp-plugin",
-        val version: String = "1.0.10"
+        val version: String = "1.1.0"
     )
 
     data class FsCapabilities(
@@ -40,16 +42,75 @@ object AcpModels {
         val description: String? = null
     )
 
+    /**
+     * 服务端在 `initialize` 中声明的官方 ACP 能力全集（对应 Antigravity ACP Server 等实现）。
+     */
+    data class AgentCapabilitiesSummary(
+        val loadSession: Boolean = false,
+        val promptImage: Boolean = false,
+        val promptAudio: Boolean = false,
+        val promptEmbeddedContext: Boolean = false,
+        val sessionList: Boolean = false,
+        val sessionLoad: Boolean = false,
+        val sessionResume: Boolean = false,
+        val sessionClose: Boolean = false,
+        val additionalDirectories: Boolean = false,
+        val authLogout: Boolean = false,
+        val antigravityTier: Boolean = false,
+        val antigravitySystemPromptAppend: Boolean = false
+    ) {
+        fun toTooltipHtml(): String {
+            fun mark(ok: Boolean) = if (ok) "✅" else "➖"
+            return "<html><b>官方 ACP 协商能力</b><br/>" +
+                "${mark(promptImage)} 图片多模态输入 (promptCapabilities.image)<br/>" +
+                "${mark(promptEmbeddedContext)} 结构化上下文块 (promptCapabilities.embeddedContext)<br/>" +
+                "${mark(sessionList)} 历史会话列表 (session/list)<br/>" +
+                "${mark(sessionLoad || loadSession)} 历史会话回放 (session/load)<br/>" +
+                "${mark(sessionResume)} 快速续聊 (session/resume)<br/>" +
+                "${mark(sessionClose)} 会话优雅关闭 (session/close)<br/>" +
+                "${mark(additionalDirectories)} 多目录工作区 (additionalDirectories)<br/>" +
+                "${mark(authLogout)} 官方退出/切换账号 (auth.logout)<br/>" +
+                "${mark(antigravitySystemPromptAppend)} 系统提示词追加 (systemPrompt.append)<br/>" +
+                "${mark(antigravityTier)} 账号订阅等级识别 (antigravity.tier)</html>"
+        }
+    }
+
     data class InitializeResult(
         val protocolVersion: Int = 1,
         val authMethods: List<AuthMethod> = emptyList(),
         val agentInfo: JsonObject? = null,
         val agentCapabilities: JsonObject? = null
     ) {
-        fun supportsLogout(): Boolean {
-            if (protocolVersion >= 2 && authMethods.isNotEmpty()) return true
-            val authObj = agentCapabilities?.getAsJsonObject("auth") ?: return false
-            return authObj.has("logout") && !authObj.get("logout").isJsonNull
+        fun supportsLogout(): Boolean = parseCapabilities().authLogout
+
+        fun parseCapabilities(): AgentCapabilitiesSummary {
+            val caps = agentCapabilities ?: return AgentCapabilitiesSummary(
+                authLogout = protocolVersion >= 2 && authMethods.isNotEmpty()
+            )
+            val promptCaps = caps.getObjOrNull("promptCapabilities")
+            val sessionCaps = caps.getObjOrNull("sessionCapabilities")
+                ?: caps.getObjOrNull("session_capabilities")
+            val authCaps = caps.getObjOrNull("auth")
+            val agMeta = caps.getObjOrNull("_meta")?.getObjOrNull("antigravity")
+
+            val loadSessionFlag = caps.getBool("loadSession") || caps.getBool("load_session")
+            val logoutFlag = (protocolVersion >= 2 && authMethods.isNotEmpty()) ||
+                (authCaps?.hasNonNull("logout") == true)
+
+            return AgentCapabilitiesSummary(
+                loadSession = loadSessionFlag,
+                promptImage = promptCaps?.getBool("image") == true,
+                promptAudio = promptCaps?.getBool("audio") == true,
+                promptEmbeddedContext = promptCaps?.getBool("embeddedContext") == true,
+                sessionList = sessionCaps?.hasNonNull("list") == true,
+                sessionLoad = sessionCaps?.hasNonNull("load") == true || loadSessionFlag,
+                sessionResume = sessionCaps?.hasNonNull("resume") == true,
+                sessionClose = sessionCaps?.hasNonNull("close") == true,
+                additionalDirectories = sessionCaps?.hasNonNull("additionalDirectories") == true,
+                authLogout = logoutFlag,
+                antigravityTier = agMeta?.getBool("tier") == true,
+                antigravitySystemPromptAppend = agMeta?.getObjOrNull("systemPrompt")?.getBool("append") == true
+            )
         }
     }
 
@@ -61,6 +122,61 @@ object AcpModels {
         val cwd: String,
         val mcpServers: List<Any> = emptyList()
     )
+
+    data class CloseSessionParams(
+        val sessionId: String
+    )
+
+    /**
+     * 构造官方 ACP `session/new` 参数：仅在服务端支持且非空时携带 `additionalDirectories` 与 `_meta.antigravity.systemPrompt.append`。
+     */
+    fun buildNewSessionParamsJson(
+        cwd: String,
+        additionalDirectories: List<String> = emptyList(),
+        systemPromptAppend: String? = null
+    ): JsonObject = JsonObject().apply {
+        addProperty("cwd", cwd)
+        add("mcpServers", JsonArray())
+        attachSessionExtras(this, additionalDirectories, systemPromptAppend)
+    }
+
+    /**
+     * 构造官方 ACP `session/load` 或 `session/resume` 参数。
+     */
+    fun buildSessionTargetParamsJson(
+        sessionId: String,
+        cwd: String,
+        additionalDirectories: List<String> = emptyList(),
+        systemPromptAppend: String? = null
+    ): JsonObject = JsonObject().apply {
+        addProperty("sessionId", sessionId)
+        addProperty("cwd", cwd)
+        add("mcpServers", JsonArray())
+        attachSessionExtras(this, additionalDirectories, systemPromptAppend)
+    }
+
+    private fun attachSessionExtras(
+        target: JsonObject,
+        additionalDirectories: List<String>,
+        systemPromptAppend: String?
+    ) {
+        val cleanDirs = additionalDirectories.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (cleanDirs.isNotEmpty()) {
+            val arr = JsonArray()
+            cleanDirs.forEach { arr.add(it) }
+            target.add("additionalDirectories", arr)
+        }
+        val cleanAppend = systemPromptAppend?.trim().orEmpty()
+        if (cleanAppend.isNotEmpty()) {
+            target.add("_meta", JsonObject().apply {
+                add("antigravity", JsonObject().apply {
+                    add("systemPrompt", JsonObject().apply {
+                        addProperty("append", cleanAppend)
+                    })
+                })
+            })
+        }
+    }
 
     data class SessionSummary(
         val sessionId: String,
@@ -180,6 +296,50 @@ object AcpModels {
         val type: String = "text",
         val text: String? = null
     )
+
+    /**
+     * 官方 ACP v1 多模态 / 结构化提示块（无多余 null 字段序列化，严格贴合规范）。
+     */
+    sealed class PromptBlock {
+        abstract fun toJsonObject(): JsonObject
+
+        data class Text(val text: String) : PromptBlock() {
+            override fun toJsonObject(): JsonObject = JsonObject().apply {
+                addProperty("type", "text")
+                addProperty("text", text)
+            }
+        }
+
+        data class Image(val data: String, val mimeType: String) : PromptBlock() {
+            override fun toJsonObject(): JsonObject = JsonObject().apply {
+                addProperty("type", "image")
+                addProperty("data", data)
+                addProperty("mimeType", mimeType)
+            }
+        }
+
+        data class EmbeddedResource(
+            val uri: String,
+            val mimeType: String,
+            val text: String
+        ) : PromptBlock() {
+            override fun toJsonObject(): JsonObject = JsonObject().apply {
+                addProperty("type", "resource")
+                add("resource", JsonObject().apply {
+                    addProperty("uri", uri)
+                    addProperty("mimeType", mimeType)
+                    addProperty("text", text)
+                })
+            }
+        }
+    }
+
+    fun buildPromptParamsJson(sessionId: String, blocks: List<PromptBlock>): JsonObject = JsonObject().apply {
+        addProperty("sessionId", sessionId)
+        val arr = JsonArray()
+        blocks.forEach { arr.add(it.toJsonObject()) }
+        add("prompt", arr)
+    }
 
     data class PromptParams(
         val sessionId: String,
@@ -347,6 +507,39 @@ object AcpModels {
             return element.asJsonArray.joinToString("") { extractTextContent(it) }
         }
         return ""
+    }
+
+    fun formatUsageSummary(used: Long, size: Long): String {
+        if (used <= 0L && size <= 0L) return ""
+        val usedStr = formatTokenCount(used)
+        return if (size > 0L) {
+            val pct = (used.toDouble() * 100.0 / size.toDouble()).coerceIn(0.0, 100.0)
+            val pctStr = String.format(Locale.US, "%.1f%%", pct)
+            "上下文 $usedStr / ${formatTokenCount(size)} ($pctStr)"
+        } else {
+            "已用 $usedStr tokens"
+        }
+    }
+
+    private fun formatTokenCount(count: Long): String = when {
+        count >= 1_000_000L -> String.format(Locale.US, "%.1fM", count / 1_000_000.0)
+        count >= 1_000L -> String.format(Locale.US, "%.1fk", count / 1_000.0)
+        else -> count.toString()
+    }
+
+    private fun JsonObject.getObjOrNull(key: String): JsonObject? {
+        val elem = get(key) ?: return null
+        return if (elem.isJsonObject) elem.asJsonObject else null
+    }
+
+    private fun JsonObject.getBool(key: String): Boolean {
+        val elem = get(key) ?: return false
+        return elem.isJsonPrimitive && elem.asJsonPrimitive.isBoolean && elem.asBoolean
+    }
+
+    private fun JsonObject.hasNonNull(key: String): Boolean {
+        val elem = get(key) ?: return false
+        return !elem.isJsonNull
     }
 
     private fun extractLocations(element: JsonElement?): List<String> {

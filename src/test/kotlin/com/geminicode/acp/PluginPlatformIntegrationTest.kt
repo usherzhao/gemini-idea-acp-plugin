@@ -1,6 +1,7 @@
 package com.geminicode.acp
 
 import com.geminicode.acp.ide.CodeReference
+import com.geminicode.acp.ide.ImageAttachmentHelper
 import com.geminicode.acp.protocol.AcpClientService
 import com.geminicode.acp.settings.GeminiAcpConfigurable
 import com.geminicode.acp.settings.GeminiAcpSettingsState
@@ -183,8 +184,63 @@ class PluginPlatformIntegrationTest : BasePlatformTestCase() {
             assertEquals(4, resolvedAll.size)
             assertTrue(resolvedAll.any { it.relativePath == "docs/a/SKILL.md" })
             assertTrue(resolvedAll.any { it.relativePath == "docs/b/SKILL.md" })
+
+            // 验证多模态图片附件加入与计数
+            val dummyImg = ImageAttachmentHelper.ImageAttachment(
+                displayName = "shot.png",
+                mimeType = "image/png",
+                base64Data = "iVBORw0KGgo=",
+                width = 100,
+                height = 80,
+                sizeBytes = 1024
+            )
+            panel.addImageAttachments(listOf(dummyImg))
+            PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+            assertEquals(1, panel.pendingImageCount())
         } finally {
             Disposer.dispose(panel)
+        }
+    }
+
+    fun testAgyCliFlagsAndProjectAdditionalDirectoriesPersistence() {
+        val service = AcpClientService.getInstance(project)
+        val settings = GeminiAcpSettingsState.getInstance()
+        val extraDir = java.nio.file.Files.createTempDirectory("acp-extra-dir").toFile()
+        try {
+            val agyRes = GeminiExecutableResolver.ResolutionResult(
+                found = true,
+                executablePath = "C:/Users/dev/AppData/Local/agy/bin/agy.exe",
+                needsCmdWrapper = false,
+                checkedLocations = emptyList(),
+                backendKind = GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY
+            )
+            val customState = GeminiAcpSettingsState.State(
+                agySandbox = true,
+                agyDisableTelemetry = true,
+                agyAgentName = "coder"
+            )
+            val cmd = service.buildCommand(agyRes, "--acp", customState, listOf(extraDir.absolutePath))
+            assertEquals(
+                listOf(
+                    "C:/Users/dev/AppData/Local/agy/bin/agy.exe",
+                    "acp",
+                    "--sandbox",
+                    "--disable-telemetry",
+                    "--agent",
+                    "coder",
+                    "--add-dir",
+                    extraDir.absolutePath
+                ),
+                cmd
+            )
+
+            val fakeProj = "D:/TempTestProj/service-a"
+            settings.setAdditionalDirectories(fakeProj, listOf(extraDir.absolutePath, extraDir.absolutePath))
+            assertEquals(1, settings.getAdditionalDirectories(fakeProj).size)
+            settings.setAdditionalDirectories(fakeProj, emptyList())
+            assertTrue(settings.getAdditionalDirectories(fakeProj).isEmpty())
+        } finally {
+            extraDir.deleteRecursively()
         }
     }
 }

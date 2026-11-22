@@ -1,8 +1,10 @@
 package com.geminicode.acp.ui
 
+import com.geminicode.acp.ide.AcpContextBuilder
 import com.geminicode.acp.ide.CodeReference
 import com.geminicode.acp.ide.EditorDiffApplyUtil
 import com.geminicode.acp.ide.IdeaContextCollector
+import com.geminicode.acp.ide.ImageAttachmentHelper
 import com.geminicode.acp.ide.ProjectFileIndexHelper
 import com.geminicode.acp.ide.SkillDiscoveryService
 import com.geminicode.acp.protocol.AcpClientService
@@ -14,10 +16,13 @@ import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBCheckBox
@@ -36,12 +41,19 @@ import java.awt.GridBagLayout
 import java.awt.Insets
 import java.awt.Rectangle
 import java.awt.Toolkit
+import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
+import java.awt.dnd.DnDConstants
+import java.awt.dnd.DropTarget
+import java.awt.dnd.DropTargetAdapter
+import java.awt.dnd.DropTargetDropEvent
 import java.awt.event.FocusAdapter
 import java.awt.event.FocusEvent
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
+import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.swing.Box
 import javax.swing.BoxLayout
@@ -77,6 +89,11 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         foreground = JBColor.GRAY
         font = font.deriveFont(Font.PLAIN, 11f)
     }
+    private val usageLabel = JBLabel("").apply {
+        foreground = JBColor.GRAY
+        font = font.deriveFont(Font.PLAIN, 11f)
+        isVisible = false
+    }
     private val renameCurrentButton = JButton("重命名").apply {
         font = font.deriveFont(11f)
         margin = Insets(1, 6, 1, 6)
@@ -93,6 +110,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     }
     private val historyButton = JButton("历史记录")
     private val newSessionButton = JButton("新对话")
+    private val additionalDirsButton = JButton("关联目录").apply {
+        toolTipText = "管理官方 ACP additionalDirectories 跨项目关联工作区目录"
+    }
     private val logToggleButton = JButton("日志")
     private val settingsButton = JButton("设置")
 
@@ -149,6 +169,11 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
     private val attachContextCheck = JBCheckBox("自动引用当前文件/行号", true)
     private val contextBadgeLabel = JBLabel("")
+    private val attachImageButton = JButton("🖼️ 图片").apply {
+        font = font.deriveFont(11f)
+        margin = Insets(1, 6, 1, 6)
+        toolTipText = "添加图片（支持官方 ACP 多模态 image 块；也可直接在输入框 Ctrl+V 粘贴截图或拖拽图片）"
+    }
 
     /**
      * 与输入框内精简 `@文件名` 实时同步的轻量级代码位置引用条，以及精简展示名 -> 真实完整路径的绑定表。
@@ -160,10 +185,25 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         isVisible = false
     }
 
-    private val inputArea = JBTextArea(3, 40).apply {
+    /**
+     * 待发送的图片附件列表（基于官方 ACP `promptCapabilities.image`）。
+     */
+    private val pendingImages = mutableListOf<ImageAttachmentHelper.ImageAttachment>()
+    private val pasteImageCounter = AtomicInteger(1)
+    private val imagesBar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
+        isOpaque = false
+        isVisible = false
+    }
+
+    private val inputArea = object : JBTextArea(3, 40) {
+        override fun paste() {
+            if (tryPasteImagesFromClipboard()) return
+            super.paste()
+        }
+    }.apply {
         lineWrap = true
         wrapStyleWord = true
-        emptyText.text = "输入需求，支持 @ 模糊搜索引用文件、/ 选择已安装 Skills；Enter 发送，Shift+Enter 换行"
+        emptyText.text = "输入需求，支持 @ 模糊搜索文件、/ 选择 Skills、Ctrl+V 粘贴截图或拖拽图片；Enter 发送，Shift+Enter 换行"
     }
     private val sendOrStopButton = JButton("发送")
 
@@ -214,6 +254,12 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                     bannerPanel.isVisible = false
                 }
                 refreshAccountStatus()
+            }
+        }
+
+        override fun onCapabilitiesUpdated(capabilities: AcpModels.AgentCapabilitiesSummary) {
+            runOnUi {
+                statusLabel.toolTipText = capabilities.toTooltipHtml()
             }
         }
 
@@ -286,6 +332,12 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             }
         }
 
+        override fun onUsageUpdated(usage: AcpModels.SessionUpdateEvent.UsageEvent?) {
+            runOnUi {
+                updateUsageIndicator(usage)
+            }
+        }
+
         override fun onTurnFinished(stopReason: String?) {
             runOnUi {
                 activeAssistantCard?.finalizeTurn(stopReason)
@@ -336,6 +388,11 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         acpService.addListener(eventListener)
         acpService.lastMetadata?.let { rebuildOfficialConfigSelectors(it) }
         acpService.activeSessionTitle?.let { sessionTitleLabel.text = "当前对话：$it" }
+        acpService.lastUsage?.let { updateUsageIndicator(it) }
+        if (acpService.currentState == AcpClientService.ConnectionState.READY) {
+            statusLabel.toolTipText = acpService.capabilities.toTooltipHtml()
+        }
+        refreshAdditionalDirsButton()
         preloadLocalSkillsAsync()
         refreshAccountStatus()
         refreshContextPreview()
@@ -433,11 +490,16 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(accountLabel, BorderLayout.EAST)
         }
 
+        val titleRightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+            isOpaque = false
+            add(usageLabel)
+            add(renameCurrentButton)
+        }
         val titleRow = JPanel(BorderLayout(6, 0)).apply {
             isOpaque = false
             border = JBUI.Borders.empty(2, 0)
             add(sessionTitleLabel, BorderLayout.CENTER)
-            add(renameCurrentButton, BorderLayout.EAST)
+            add(titleRightPanel, BorderLayout.EAST)
         }
 
         val buttonRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
@@ -447,6 +509,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(terminalLoginButton)
             add(historyButton)
             add(newSessionButton)
+            add(additionalDirsButton)
             add(logToggleButton)
             add(settingsButton)
         }
@@ -479,13 +542,20 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
 
         val refreshCtxBtn = JButton("刷新位置").apply {
+            font = font.deriveFont(11f)
+            margin = Insets(1, 6, 1, 6)
             addActionListener { refreshContextPreview() }
+        }
+        val contextActions = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            isOpaque = false
+            add(attachImageButton)
+            add(refreshCtxBtn)
         }
         val contextBar = JPanel(BorderLayout(6, 0)).apply {
             isOpaque = false
             add(attachContextCheck, BorderLayout.WEST)
             add(contextBadgeLabel, BorderLayout.CENTER)
-            add(refreshCtxBtn, BorderLayout.EAST)
+            add(contextActions, BorderLayout.EAST)
         }
 
         val composerTopStack = JPanel().apply {
@@ -493,8 +563,10 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             isOpaque = false
             contextBar.alignmentX = LEFT_ALIGNMENT
             referencesBar.alignmentX = LEFT_ALIGNMENT
+            imagesBar.alignmentX = LEFT_ALIGNMENT
             add(contextBar)
             add(referencesBar)
+            add(imagesBar)
         }
 
         val inputScroll = JBScrollPane(inputArea).apply {
@@ -669,6 +741,8 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         switchAccountButton.addActionListener { triggerSwitchAccount() }
         terminalLoginButton.addActionListener { TerminalLoginLauncher.launchInteractiveGeminiLogin(project) }
         historyButton.addActionListener { openHistoryDialog() }
+        additionalDirsButton.addActionListener { openAdditionalDirectoriesDialog() }
+        attachImageButton.addActionListener { chooseImageFiles() }
         renameCurrentButton.addActionListener { renameCurrentSession() }
         logToggleButton.addActionListener {
             logScrollPane.isVisible = !logScrollPane.isVisible
@@ -758,6 +832,40 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 if (e.keyCode == KeyEvent.VK_ENTER && !e.isShiftDown && !isStreaming && !isLoadingHistory) {
                     e.consume()
                     sendFromInputBox()
+                }
+            }
+        })
+
+        // 支持直接拖拽图片或项目代码文件到输入框（图片作为多模态附件，代码文件直接插入精简 @文件名）
+        DropTarget(inputArea, object : DropTargetAdapter() {
+            override fun drop(dtde: DropTargetDropEvent) {
+                runCatching {
+                    if (!dtde.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                        dtde.rejectDrop()
+                        return
+                    }
+                    dtde.acceptDrop(DnDConstants.ACTION_COPY)
+                    @Suppress("UNCHECKED_CAST")
+                    val dropped = dtde.transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<File>
+                    val files = dropped.orEmpty()
+                    val imgs = mutableListOf<ImageAttachmentHelper.ImageAttachment>()
+                    val refs = mutableListOf<CodeReference>()
+                    val lfs = LocalFileSystem.getInstance()
+                    for (f in files) {
+                        if (ImageAttachmentHelper.isSupportedImageFile(f)) {
+                            ImageAttachmentHelper.loadFromFile(f)?.let { imgs.add(it) }
+                        } else {
+                            val vFile = lfs.findFileByIoFile(f)
+                            if (vFile != null && vFile.isValid) {
+                                refs.add(IdeaContextCollector.captureVirtualFileReference(project, vFile))
+                            }
+                        }
+                    }
+                    if (imgs.isNotEmpty()) addImageAttachments(imgs)
+                    if (refs.isNotEmpty()) addCodeReferences(refs)
+                    dtde.dropComplete(true)
+                }.onFailure {
+                    runCatching { dtde.dropComplete(false) }
                 }
             }
         })
@@ -1042,6 +1150,128 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         acpService.renameSession(sid, input)
     }
 
+    private fun openAdditionalDirectoriesDialog() {
+        val current = GeminiAcpSettingsState.getInstance().getAdditionalDirectories(project.basePath)
+        val dialog = AdditionalDirectoriesDialog(project, current)
+        if (dialog.showAndGet()) {
+            val updated = dialog.getSelectedDirectories()
+            acpService.applyAdditionalDirectories(updated).whenComplete { hotApplied, _ ->
+                runOnUi {
+                    refreshAdditionalDirsButton()
+                    val statusHint = if (hotApplied == true) {
+                        "已更新并热同步 ${updated.size} 个关联工作区目录（additionalDirectories）。"
+                    } else {
+                        "已保存 ${updated.size} 个关联工作区目录，将在下次连接或新建对话时自动传入。"
+                    }
+                    appendDiagnosticLog(statusHint)
+                }
+            }
+        }
+    }
+
+    private fun refreshAdditionalDirsButton() {
+        val count = GeminiAcpSettingsState.getInstance().getAdditionalDirectories(project.basePath).size
+        additionalDirsButton.text = if (count > 0) "关联目录($count)" else "关联目录"
+    }
+
+    private fun chooseImageFiles() {
+        val descriptor = FileChooserDescriptor(true, false, false, false, false, true)
+            .withFileFilter { vFile ->
+                val ext = vFile.extension?.lowercase().orEmpty()
+                ext in ImageAttachmentHelper.supportedExtensions
+            }
+            .withTitle("选择图片附件 (ACP 多模态)")
+            .withDescription("支持 PNG / JPG / WEBP / GIF / BMP，最多可同时选择多张图片")
+        val chosen = FileChooser.chooseFiles(descriptor, project, null)
+        if (chosen.isEmpty()) return
+        val loaded = chosen.mapNotNull { vFile ->
+            ImageAttachmentHelper.loadFromFile(File(vFile.path))
+        }
+        if (loaded.isEmpty()) {
+            Messages.showWarningDialog(project, "未能读取所选图片（单张图片需不超过 4 MB 且为常见图片格式）。", "添加图片失败")
+            return
+        }
+        addImageAttachments(loaded)
+    }
+
+    private fun tryPasteImagesFromClipboard(): Boolean {
+        val images = ImageAttachmentHelper.readImagesFromClipboard(pasteImageCounter.get())
+        if (images.isEmpty()) return false
+        pasteImageCounter.addAndGet(images.size)
+        addImageAttachments(images)
+        return true
+    }
+
+    internal fun addImageAttachments(images: List<ImageAttachmentHelper.ImageAttachment>) {
+        if (images.isEmpty()) return
+        runOnUi {
+            pendingImages.addAll(images)
+            rebuildImagesBar()
+            inputArea.requestFocusInWindow()
+        }
+    }
+
+    internal fun pendingImageCount(): Int = pendingImages.size
+
+    private fun rebuildImagesBar() {
+        imagesBar.removeAll()
+        if (pendingImages.isEmpty()) {
+            imagesBar.isVisible = false
+            imagesBar.revalidate()
+            imagesBar.repaint()
+            return
+        }
+        for (img in pendingImages.toList()) {
+            val chip = JButton("🖼️ ${img.chipLabel()}  ×").apply {
+                font = font.deriveFont(11f)
+                margin = Insets(1, 6, 1, 6)
+                toolTipText = "点击移除图片附件（将通过官方 ACP image 块发送）：${img.mimeType}"
+                addActionListener {
+                    pendingImages.remove(img)
+                    rebuildImagesBar()
+                    inputArea.requestFocusInWindow()
+                }
+            }
+            imagesBar.add(chip)
+        }
+        if (pendingImages.size > 1) {
+            val clearImagesBtn = JButton("清空图片").apply {
+                font = font.deriveFont(11f)
+                margin = Insets(1, 6, 1, 6)
+                addActionListener {
+                    pendingImages.clear()
+                    rebuildImagesBar()
+                    inputArea.requestFocusInWindow()
+                }
+            }
+            imagesBar.add(clearImagesBtn)
+        }
+        imagesBar.isVisible = true
+        imagesBar.revalidate()
+        imagesBar.repaint()
+    }
+
+    private fun updateUsageIndicator(usage: AcpModels.SessionUpdateEvent.UsageEvent?) {
+        if (usage == null || (usage.used <= 0L && usage.size <= 0L)) {
+            usageLabel.text = ""
+            usageLabel.isVisible = false
+            return
+        }
+        usageLabel.text = AcpModels.formatUsageSummary(usage.used, usage.size)
+        val highRatio = usage.size > 0L && usage.used.toDouble() / usage.size.toDouble() >= 0.8
+        usageLabel.foreground = if (highRatio) {
+            JBColor(Color(0xB45309), Color(0xFBBF24))
+        } else {
+            JBColor.GRAY
+        }
+        usageLabel.toolTipText = if (highRatio) {
+            "当前对话上下文已超过 80%（${usage.used} / ${usage.size} tokens），建议新建对话保持最佳响应质量"
+        } else {
+            "官方 ACP 实时上下文窗口用量：${usage.used} / ${usage.size} tokens"
+        }
+        usageLabel.isVisible = true
+    }
+
     private fun openHistoryDialog() {
         if (isStreaming || isLoadingHistory) {
             Messages.showInfoMessage(project, "请先等待当前生成完成或点击停止，再切换对话。", "历史记录")
@@ -1050,7 +1280,12 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         val dialog = SessionHistoryDialog(project, acpService)
         if (dialog.showAndGet()) {
             val target = dialog.selectedSession ?: return
-            acpService.loadSession(target).whenComplete { _, err ->
+            val future = if (dialog.resumeMode && acpService.capabilities.sessionResume) {
+                acpService.resumeSession(target)
+            } else {
+                acpService.loadSession(target)
+            }
+            future.whenComplete { _, err ->
                 if (err != null) {
                     runOnUi {
                         appendDiagnosticLog("切换历史会话失败: ${err.message}")
@@ -1194,12 +1429,17 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         completionPopup.hide()
         activeTrigger = null
         val text = inputArea.text.trim()
-        if (text.isEmpty()) return
+        if (text.isEmpty() && pendingImages.isEmpty()) return
 
         val collectedRefs = mutableListOf<CodeReference>()
-        collectedRefs.addAll(
-            CodeReference.extractInlineReferences(text, project.basePath, bindings = knownInlinePathBindings)
-        )
+        if (text.isNotEmpty()) {
+            collectedRefs.addAll(
+                CodeReference.extractInlineReferences(text, project.basePath, bindings = knownInlinePathBindings)
+            )
+        }
+        val attachedImages = pendingImages.toList()
+        pendingImages.clear()
+        rebuildImagesBar()
 
         knownInlinePathBindings.clear()
         suppressTriggerRefresh = true
@@ -1217,25 +1457,45 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
         refreshContextPreview()
 
-        executePromptTurn(text, collectedRefs)
+        val effectivePrompt = text.ifEmpty { "请查看并分析附带的图片内容。" }
+        executePromptTurn(effectivePrompt, collectedRefs, attachedImages)
     }
 
-    private fun executePromptTurn(userPrompt: String, references: List<CodeReference>) {
+    private fun executePromptTurn(
+        userPrompt: String,
+        references: List<CodeReference>,
+        images: List<ImageAttachmentHelper.ImageAttachment> = emptyList()
+    ) {
         if (isStreaming || isLoadingHistory) {
             Messages.showInfoMessage(project, "正在处理中，请稍候或先点击停止。", "Gemini 助手")
             return
         }
-        val uniqueRefs = references.distinctBy {
-            Triple(it.absolutePath.replace('\\', '/').lowercase(), it.startLine, it.endLine)
-        }
-        addCard(UserTurnCard(userPrompt, uniqueRefs.map { it.chipLabel() }))
+        val uniqueRefs = references.distinctBy { it.dedupKey() }
+        addCard(
+            UserTurnCard(
+                prompt = userPrompt,
+                refBadges = uniqueRefs.map { it.chipLabel() },
+                imageBadges = images.map { it.displayName }
+            )
+        )
         val assistantCard = AssistantTurnCard()
         activeAssistantCard = assistantCard
         addCard(assistantCard)
         scrollToBottom()
 
+        val settingsState = GeminiAcpSettingsState.getInstance().state
+        val embeddedResources = if (settingsState.enableEmbeddedContext) {
+            AcpContextBuilder.buildEmbeddedResourceBlocks(
+                references = uniqueRefs,
+                maxTotalChars = settingsState.maxAttachedFileChars,
+                contentReader = { path -> EditorDiffApplyUtil.readDocumentOrDiskText(path) }
+            )
+        } else {
+            emptyList()
+        }
+
         val fullPrompt = CodeReference.formatPromptWithReferences(userPrompt, uniqueRefs)
-        acpService.sendPrompt(fullPrompt).whenComplete { _, err ->
+        acpService.sendPrompt(fullPrompt, images, embeddedResources).whenComplete { _, err ->
             if (err != null) {
                 runOnUi {
                     assistantCard.appendBody("\n\n❌ 请求失败：${err.message}\n\n可点击顶部「日志」查看详细原因。")
@@ -1329,9 +1589,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(
                 JBLabel(
                     "<html><b>Gemini 对话编程助手 (ACP)</b><br/>" +
-                        "1. 输入 <code>@</code> 可<b>模糊搜索</b>并引用项目文件（支持文件名/驼峰首字母/路径）；输入 <code>/</code> 可模糊选择已安装的 Skills。<br/>" +
-                        "2. 在左侧项目树、编辑器标签页或导航栏<b>右键文件 → 引用文件到 Gemini 对话框</b>，或在编辑器内右键引用<b>选中行/当前行</b>，仅传路径与行号不粘贴源码。<br/>" +
-                        "3. 底部可切换官方 <b>模型 / 思考强度 / 模式</b>，顶部可查看并重命名 <b>历史记录</b>。<br/><br/>" +
+                        "1. 输入 <code>@</code> 可<b>模糊搜索</b>并引用文件，输入 <code>/</code> 可选择 Skills；支持 <b>Ctrl+V 粘贴截图</b> 或拖拽图片多模态提问。<br/>" +
+                        "2. 在项目树/标签页/导航栏或编辑器内<b>右键文件或选中行</b>直接引用到对话框（精简显示文件名+行号，后台通过官方 <code>embeddedContext</code> 传递）。<br/>" +
+                        "3. 顶部支持 <b>切换账号</b>、<b>历史记录（回放 / 快速续聊 Resume）</b>、<b>关联目录</b>；设置中支持 <code>systemPrompt.append</code>、<code>.gemini/rules.md</code> 与 <code>--sandbox</code>。<br/><br/>" +
                         "<b>环境检测：</b>$envHint</html>"
                 ),
                 BorderLayout.CENTER
@@ -1363,7 +1623,11 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
     }
 
-    private inner class UserTurnCard(prompt: String, refBadges: List<String>) : JPanel(BorderLayout(0, 4)) {
+    private inner class UserTurnCard(
+        prompt: String,
+        refBadges: List<String>,
+        imageBadges: List<String> = emptyList()
+    ) : JPanel(BorderLayout(0, 4)) {
         private val area = JBTextArea(prompt).apply {
             isEditable = false
             lineWrap = true
@@ -1378,12 +1642,14 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                 JBUI.Borders.empty(8)
             )
             background = JBColor(Color(0xEFF6FF), Color(0x172554))
-            val header = if (refBadges.isNotEmpty()) {
-                "你  ·  引用：${refBadges.joinToString(", ")}"
-            } else {
-                "你"
+            val parts = mutableListOf("你")
+            if (refBadges.isNotEmpty()) {
+                parts.add("引用：${refBadges.joinToString(", ")}")
             }
-            add(JBLabel("<html><b>$header</b></html>"), BorderLayout.NORTH)
+            if (imageBadges.isNotEmpty()) {
+                parts.add("图片：${imageBadges.joinToString(", ")}")
+            }
+            add(JBLabel("<html><b>${parts.joinToString("  ·  ")}</b></html>"), BorderLayout.NORTH)
             add(area, BorderLayout.CENTER)
         }
 
