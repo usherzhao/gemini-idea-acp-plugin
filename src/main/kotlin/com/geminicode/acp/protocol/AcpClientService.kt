@@ -1,10 +1,12 @@
 package com.geminicode.acp.protocol
 
 import com.geminicode.acp.ide.AcpContextBuilder
+import com.geminicode.acp.ide.DataPermissionConfig
 import com.geminicode.acp.ide.IdeaFsHandler
 import com.geminicode.acp.ide.ImageAttachmentHelper
 import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.geminicode.acp.settings.GeminiExecutableResolver
+import com.geminicode.acp.ui.AgyLoginOutputParser
 import com.google.gson.Gson
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
@@ -17,6 +19,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -56,7 +59,7 @@ class AcpClientService(private val project: Project) : Disposable {
     private val logger = Logger.getInstance(AcpClientService::class.java)
     private val gson = Gson()
     private val listeners = CopyOnWriteArrayList<AcpEventListener>()
-    private val fsHandler = IdeaFsHandler(project)
+    private val fsHandler = IdeaFsHandler(project) { msg -> notifyLog(msg) }
     private val replayingHistory = AtomicBoolean(false)
     private val lifecycleExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "GeminiAcp-Lifecycle").apply { isDaemon = true }
@@ -107,6 +110,24 @@ class AcpClientService(private val project: Project) : Disposable {
     @Volatile
     var lastUsage: AcpModels.SessionUpdateEvent.UsageEvent? = null
         private set
+
+    @Volatile
+    var loggedInEmail: String? = null
+        private set
+
+    fun isConnectedAndAuthenticated(): Boolean =
+        transport?.isAlive() == true && activeSessionId != null
+
+    fun resolveLoggedInEmail(): String? {
+        loggedInEmail?.takeIf { it.isNotBlank() }?.let { return it }
+        return runCatching { GeminiAcpSettingsState.getInstance().getLastLoggedInEmail() }.getOrNull()
+    }
+
+    fun rememberLoggedInEmail(email: String?) {
+        val trimmed = email?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        loggedInEmail = trimmed
+        runCatching { GeminiAcpSettingsState.getInstance().setLastLoggedInEmail(trimmed) }
+    }
 
     private val urlRegex = Regex("""https://accounts\.google\.com/[^\s"'<>]+""")
 
@@ -303,6 +324,53 @@ class AcpClientService(private val project: Project) : Disposable {
         }, lifecycleExecutor)
     }
 
+    /**
+     * 当用户在聊天面板调整细粒度数据权限（只读模式 / 读文件 / 写文件 / 终端命令）时即时生效：
+     * 1. 重置本次会话中的「总是允许」临时授权，防止旧放行绕过新策略；
+     * 2. 若当前已连接且服务端处于 auto / accept-edits 自动放行模式，而新策略收紧了写入或命令权限，
+     *    自动切回 default 模式，确保每次写入/命令均经由插件侧严格校验与拦截。
+     */
+    fun onDataPermissionsChanged(config: DataPermissionConfig) {
+        fsHandler.clearSessionAllowances()
+        notifyLog(
+            "已更新数据权限：只读=${if (config.readOnlyMode) "开" else "关"}，" +
+                "读文件=${config.effectiveReadLevel().displayName}，" +
+                "写文件=${config.effectiveWriteLevel().displayName}，" +
+                "终端命令=${config.effectiveCommandLevel().displayName}"
+        )
+
+        if (!config.requiresStrictServerApproval()) return
+        val activeTransport = transport?.takeIf { it.isAlive() } ?: return
+        val sid = activeSessionId ?: return
+        val meta = lastMetadata ?: return
+
+        val permissiveModes = setOf("auto", "accept-edits")
+        val modeOption = meta.configOptions.firstOrNull { (it.category ?: it.id) == "mode" }
+        if (modeOption != null && modeOption.currentValue?.lowercase() in permissiveModes) {
+            val defaultChoice = modeOption.options.firstOrNull { it.value.equals("default", ignoreCase = true) }
+            if (defaultChoice != null) {
+                setConfigOption(modeOption.id, defaultChoice.value).whenComplete { _, err ->
+                    if (err == null) {
+                        notifyLog("数据权限已收紧，已自动将 ACP 模式切回 ${defaultChoice.name} 以严格执行审批/拦截")
+                    }
+                }
+                return
+            }
+        }
+
+        if (meta.currentModeId?.lowercase() in permissiveModes &&
+            meta.modes.any { it.id.equals("default", ignoreCase = true) } &&
+            activeTransport.isAlive() &&
+            sid.isNotBlank()
+        ) {
+            setMode("default").whenComplete { _, err ->
+                if (err == null) {
+                    notifyLog("数据权限已收紧，已自动将 ACP 模式切回 default 以严格执行审批/拦截")
+                }
+            }
+        }
+    }
+
     private fun switchToHistoricalSession(
         session: AcpModels.SessionSummary,
         useResume: Boolean
@@ -334,7 +402,8 @@ class AcpClientService(private val project: Project) : Disposable {
                 val resultJson = activeTransport.sendRequest(
                     method,
                     params,
-                    timeoutSeconds = 60
+                    timeoutSeconds = 120,
+                    idleTimeout = true
                 ).get()
                 val loaded = gson.fromJson(resultJson, AcpModels.NewSessionResult::class.java)
                     ?: throw IllegalStateException("$method 返回空结果")
@@ -437,7 +506,13 @@ class AcpClientService(private val project: Project) : Disposable {
             updateState(ConnectionState.STREAMING, "正在思考并生成响应...")
             try {
                 val params = AcpModels.buildPromptParamsJson(sid, blocks)
-                val resultJson = activeTransport.sendRequest("session/prompt", params, timeoutSeconds = 300).get()
+                // 使用 600 秒流式空闲超时：只要模型持续输出思考/文本/工具调用或等待用户审批弹窗，总耗时不设上限
+                val resultJson = activeTransport.sendRequest(
+                    method = "session/prompt",
+                    params = params,
+                    timeoutSeconds = 600,
+                    idleTimeout = true
+                ).get()
                 val result = gson.fromJson(resultJson, AcpModels.PromptResult::class.java)
                 val authMode = GeminiAcpSettingsState.getInstance().state.authMethodId
                 updateState(ConnectionState.READY, formatReadyDetail(authMode, lastMetadata?.tierName))
@@ -445,7 +520,14 @@ class AcpClientService(private val project: Project) : Disposable {
                 result?.stopReason
             } catch (t: Throwable) {
                 val rootCause = unwrapCause(t)
-                updateState(ConnectionState.ERROR, rootCause.message ?: "请求失败")
+                if (rootCause is TimeoutException && activeTransport.isAlive()) {
+                    runCatching {
+                        activeTransport.sendNotification("session/cancel", AcpModels.CancelParams(sid))
+                        notifyLog("请求空闲超时，已向服务端发送取消指令 (session/cancel)")
+                    }
+                }
+                val detail = rootCause.message?.takeIf { it.isNotBlank() } ?: "请求失败 (${rootCause.javaClass.simpleName})"
+                updateState(ConnectionState.ERROR, detail)
                 throw rootCause
             }
         }, lifecycleExecutor)
@@ -652,6 +734,9 @@ class AcpClientService(private val project: Project) : Disposable {
                 urlRegex.find(line)?.value?.let { url ->
                     listeners.forEach { it.onAuthUrlDetected(url) }
                 }
+                AgyLoginOutputParser.extractLoggedInEmail(line)?.let { email ->
+                    rememberLoggedInEmail(email)
+                }
             },
             onProcessExit = { code, stderr ->
                 activeSessionId = null
@@ -699,6 +784,7 @@ class AcpClientService(private val project: Project) : Disposable {
         updateState(ConnectionState.AUTHENTICATING, "正在执行 $chosenAuth 认证（请在弹出的浏览器中完成账号授权）...")
         val authResult = newTransport.sendRequest("authenticate", AcpModels.AuthenticateParams(chosenAuth), timeoutSeconds = 180).get()
         val authTier = AcpModels.extractTierName(authResult)
+        AcpModels.extractUserEmail(authResult)?.let { rememberLoggedInEmail(it) }
         notifyLog("$chosenAuth 认证成功" + (authTier?.let { " ($it)" } ?: ""))
 
         clearUsage()
@@ -763,6 +849,7 @@ class AcpClientService(private val project: Project) : Disposable {
     private fun publishSession(session: AcpModels.NewSessionResult, fallbackTier: String?): AcpModels.SessionMetadata {
         activeSessionId = session.sessionId
         val tier = AcpModels.extractTierName(session._meta) ?: fallbackTier
+        AcpModels.extractUserEmail(session._meta)?.let { rememberLoggedInEmail(it) }
         val meta = AcpModels.SessionMetadata(
             sessionId = session.sessionId,
             configOptions = session.configOptions,
@@ -877,6 +964,8 @@ class AcpClientService(private val project: Project) : Disposable {
 
     private fun clearAuthAndDisconnectInternal() {
         lastMetadata = null
+        loggedInEmail = null
+        runCatching { GeminiAcpSettingsState.getInstance().setLastLoggedInEmail(null) }
         availableCommands = emptyList()
         clearUsage()
         fsHandler.clearSessionAllowances()

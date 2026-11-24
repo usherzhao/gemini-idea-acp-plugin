@@ -11,7 +11,9 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 
 class JsonRpcTransportTest {
@@ -152,5 +154,113 @@ class JsonRpcTransportTest {
             transport.close()
         }
         assertNull(runCatching { exitLatch.await(1, TimeUnit.SECONDS) }.exceptionOrNull())
+    }
+
+    @Test
+    fun `idleTimeout keeps long streaming and user-dialog requests alive but times out true silence`() {
+        val workDir = tempFolder.newFolder("idle-proj")
+        val mockJava = tempFolder.newFile("MockStreamingAgent.java").toPath()
+        Files.writeString(
+            mockJava,
+            """
+            import java.io.*;
+            import java.nio.charset.StandardCharsets;
+
+            public class MockStreamingAgent {
+                public static void main(String[] args) throws Exception {
+                    BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+                    String line;
+                    while ((line = in.readLine()) != null) {
+                        if (line.contains("slow_stream")) {
+                            for (int i = 1; i <= 5; i++) {
+                                Thread.sleep(550);
+                                System.out.println("{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"chunk" + i + "\"}}}}");
+                                System.out.flush();
+                            }
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"stopReason\":\"end_turn\"}}");
+                            System.out.flush();
+                        } else if (line.contains("slow_dialog")) {
+                            System.out.println("{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"session/request_permission\",\"params\":{}}");
+                            System.out.flush();
+                            String ack = in.readLine();
+                            if (ack != null && ack.contains("\"id\":50")) {
+                                System.out.println("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}");
+                                System.out.flush();
+                            }
+                        } else if (line.contains("true_hang")) {
+                            // 保持静默，验证真正无响应时触发空闲超时
+                        }
+                    }
+                }
+            }
+            """.trimIndent()
+        )
+
+        val javaExe = Paths.get(System.getProperty("java.home"), "bin", "java").toString()
+        val chunks = CopyOnWriteArrayList<String>()
+
+        val transport = JsonRpcTransport(
+            command = listOf(javaExe, mockJava.toAbsolutePath().toString()),
+            workingDirectory = workDir,
+            extraEnv = emptyMap(),
+            removedEnvKeys = emptySet(),
+            requestHandler = object : JsonRpcTransport.IncomingRequestHandler {
+                override fun handleRequest(method: String, params: JsonObject): JsonObject {
+                    // 模拟用户在 Diff / 权限弹窗停留 1.5 秒（超过 1 秒空闲阈值）
+                    Thread.sleep(1500)
+                    return JsonObject()
+                }
+            },
+            onNotification = { method, params ->
+                if (method == "session/update") {
+                    val ev = AcpModels.parseSessionUpdate(params)
+                    if (ev is AcpModels.SessionUpdateEvent.AgentMessageChunk) {
+                        chunks.add(ev.text)
+                    }
+                }
+            },
+            onStderrLine = {},
+            onProcessExit = { _, _ -> }
+        )
+
+        try {
+            transport.start()
+
+            // 1. 持续流式推送总耗时 ~2.75s > idleTimeout(2s)，不应超时
+            val streamRes = transport.sendRequest(
+                method = "session/prompt",
+                params = mapOf("mode" to "slow_stream"),
+                timeoutSeconds = 2,
+                idleTimeout = true
+            ).get(15, TimeUnit.SECONDS).asJsonObject
+            assertEquals("end_turn", streamRes.get("stopReason").asString)
+            assertEquals(5, chunks.size)
+
+            // 2. 等待反向 RPC 用户确认弹窗 1.5s > idleTimeout(1s)，不应超时
+            val dialogRes = transport.sendRequest(
+                method = "session/prompt",
+                params = mapOf("mode" to "slow_dialog"),
+                timeoutSeconds = 1,
+                idleTimeout = true
+            ).get(15, TimeUnit.SECONDS).asJsonObject
+            assertEquals("end_turn", dialogRes.get("stopReason").asString)
+
+            // 3. 真正完全静默 > 1s，必须按预期抛出带清晰提示的 TimeoutException
+            var caughtTimeout: Throwable? = null
+            try {
+                transport.sendRequest(
+                    method = "session/prompt",
+                    params = mapOf("mode" to "true_hang"),
+                    timeoutSeconds = 1,
+                    idleTimeout = true
+                ).get(10, TimeUnit.SECONDS)
+            } catch (e: ExecutionException) {
+                caughtTimeout = e.cause
+            }
+            assertTrue("真正静默时应抛出 TimeoutException，实际=$caughtTimeout", caughtTimeout is TimeoutException)
+            assertTrue(caughtTimeout?.message.orEmpty().contains("空闲超时"))
+        } finally {
+            transport.close()
+        }
     }
 }

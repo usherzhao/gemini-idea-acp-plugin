@@ -18,7 +18,7 @@ object AcpModels {
 
     data class ClientInfo(
         val name: String = "gemini-idea-acp-plugin",
-        val version: String = "1.1.0"
+        val version: String = "1.2.3"
     )
 
     data class FsCapabilities(
@@ -430,6 +430,29 @@ object AcpModels {
             ?.asString
     }
 
+    /**
+     * 兼容提取官方 ACP `authenticate` / `session/new` 响应及 `_meta` 中可能携带的用户邮箱字段。
+     */
+    fun extractUserEmail(metaOrResult: JsonElement?): String? {
+        if (metaOrResult == null || !metaOrResult.isJsonObject) return null
+        val obj = metaOrResult.asJsonObject
+        val meta = obj.getObjOrNull("_meta")
+        val ag = meta?.getObjOrNull("antigravity") ?: obj.getObjOrNull("antigravity")
+
+        val candidates = listOf(
+            obj.getStringOrNull("email"),
+            obj.getObjOrNull("user")?.getStringOrNull("email"),
+            obj.getObjOrNull("account")?.getStringOrNull("email"),
+            ag?.getStringOrNull("email"),
+            ag?.getObjOrNull("user")?.getStringOrNull("email"),
+            ag?.getObjOrNull("account")?.getStringOrNull("email"),
+            meta?.getStringOrNull("email"),
+            meta?.getObjOrNull("user")?.getStringOrNull("email"),
+            meta?.getObjOrNull("account")?.getStringOrNull("email")
+        )
+        return candidates.firstOrNull { !it.isNullOrBlank() }?.trim()
+    }
+
     fun parseSessionUpdate(params: JsonObject): SessionUpdateEvent? {
         val update = params.getAsJsonObject("update") ?: return null
         val kind = update.get("sessionUpdate")?.asString ?: return null
@@ -530,6 +553,11 @@ object AcpModels {
     private fun JsonObject.getObjOrNull(key: String): JsonObject? {
         val elem = get(key) ?: return null
         return if (elem.isJsonObject) elem.asJsonObject else null
+    }
+
+    private fun JsonObject.getStringOrNull(key: String): String? {
+        val elem = get(key) ?: return null
+        return if (elem.isJsonPrimitive && elem.asJsonPrimitive.isString) elem.asString else null
     }
 
     private fun JsonObject.getBool(key: String): Boolean {

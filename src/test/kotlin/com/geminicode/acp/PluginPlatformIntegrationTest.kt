@@ -1,14 +1,20 @@
 package com.geminicode.acp
 
+import com.geminicode.acp.ide.AccessLevel
 import com.geminicode.acp.ide.CodeReference
+import com.geminicode.acp.ide.DataPermissionConfig
+import com.geminicode.acp.ide.IdeaFsHandler
 import com.geminicode.acp.ide.ImageAttachmentHelper
 import com.geminicode.acp.protocol.AcpClientService
+import com.geminicode.acp.protocol.AcpModels
+import com.geminicode.acp.protocol.JsonRpcTransport
 import com.geminicode.acp.settings.GeminiAcpConfigurable
 import com.geminicode.acp.settings.GeminiAcpSettingsState
 import com.geminicode.acp.settings.GeminiExecutableResolver
 import com.geminicode.acp.ui.GeminiChatPanel
 import com.geminicode.acp.ui.GeminiToolWindowFactory
 import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.util.Disposer
 import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
@@ -241,6 +247,162 @@ class PluginPlatformIntegrationTest : BasePlatformTestCase() {
             assertTrue(settings.getAdditionalDirectories(fakeProj).isEmpty())
         } finally {
             extraDir.deleteRecursively()
+        }
+    }
+
+    fun testConfigSelectorsRenderOnSingleCompactRow() {
+        val panel = GeminiChatPanel(project)
+        try {
+            val metadata = AcpModels.SessionMetadata(
+                sessionId = "sid-compact-row",
+                configOptions = listOf(
+                    AcpModels.ConfigOption(
+                        id = "mode",
+                        name = "Mode",
+                        category = "mode",
+                        type = "select",
+                        currentValue = "default",
+                        options = listOf(AcpModels.ConfigSelectOption("default", "Default"))
+                    ),
+                    AcpModels.ConfigOption(
+                        id = "model",
+                        name = "Model",
+                        category = "model",
+                        type = "select",
+                        currentValue = "gemini-4-neon",
+                        options = listOf(AcpModels.ConfigSelectOption("gemini-4-neon", "Gemini 4 Neon"))
+                    ),
+                    AcpModels.ConfigOption(
+                        id = "thought_level",
+                        name = "Thinking Level",
+                        category = "thought_level",
+                        type = "select",
+                        currentValue = "high",
+                        options = listOf(AcpModels.ConfigSelectOption("high", "High"))
+                    )
+                ),
+                models = emptyList(),
+                currentModelId = null,
+                modes = emptyList(),
+                currentModeId = null,
+                tierName = null
+            )
+            panel.rebuildOfficialConfigSelectors(metadata)
+            val lines = panel.selectorLinePanelsForTest()
+            assertEquals("模型 / 思考强度 / 模式应放在同一行", 1, lines.size)
+
+            val combos = lines[0].components.filterIsInstance<ComboBox<*>>()
+            assertEquals(3, combos.size)
+            // 模型顺序排首位且最大宽度受控，不会拉满整行
+            assertEquals("Gemini 4 Neon", combos[0].selectedItem.toString())
+            assertEquals("High", combos[1].selectedItem.toString())
+            assertEquals("Default", combos[2].selectedItem.toString())
+            assertTrue("模型下拉框宽度应保持紧凑，实际 preferredWidth=${combos[0].preferredSize.width}", combos[0].preferredSize.width <= 220)
+            assertTrue("模型下拉框最大宽度应受限，实际 maximumWidth=${combos[0].maximumSize.width}", combos[0].maximumSize.width <= 260)
+        } finally {
+            Disposer.dispose(panel)
+        }
+    }
+
+    fun testDataPermissionControlsEnforceReadWriteAndCommandPolicies() {
+        val settings = GeminiAcpSettingsState.getInstance()
+        val original = settings.getDataPermissionConfig()
+        val panel = GeminiChatPanel(project)
+        val logs = mutableListOf<String>()
+        val handler = IdeaFsHandler(project) { logs.add(it) }
+        val stdOptions = listOf(
+            AcpModels.PermissionOption("opt_allow_once", "允许一次", "allow_once"),
+            AcpModels.PermissionOption("opt_allow_always", "总是允许", "allow_always"),
+            AcpModels.PermissionOption("opt_reject_once", "拒绝", "reject_once")
+        )
+
+        try {
+            // 1. 切换为只读模式：禁止写入与终端命令，读文件自动放行
+            panel.applyDataPermissionConfig(DataPermissionConfig.READ_ONLY)
+            assertEquals("🔒 只读模式 ▾", panel.permissionButtonTextForTest())
+
+            var writeBlocked = false
+            try {
+                handler.handleWriteTextFile(AcpModels.FsWriteTextFileParams(path = "src/Test.kt", content = "hello"))
+            } catch (e: JsonRpcTransport.JsonRpcRemoteException) {
+                writeBlocked = e.code == -32001
+            }
+            assertTrue("只读模式下必须直接拦截 fs/write_text_file", writeBlocked)
+
+            val editRes = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Edit file", kind = "edit"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_reject_once", editRes.getAsJsonObject("outcome").get("optionId").asString)
+
+            val cmdRes = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Run shell command", kind = "execute"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_reject_once", cmdRes.getAsJsonObject("outcome").get("optionId").asString)
+
+            val readRes = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Read file", kind = "read"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_allow_once", readRes.getAsJsonObject("outcome").get("optionId").asString)
+
+            // 2. 禁止读文件：直接拦截 fs/read_text_file 与 read 权限请求
+            panel.applyDataPermissionConfig(
+                DataPermissionConfig(
+                    readOnlyMode = false,
+                    readFile = AccessLevel.DENY,
+                    writeFile = AccessLevel.ASK,
+                    command = AccessLevel.DENY
+                )
+            )
+            assertEquals("🛡️ 读:禁 写:问 命:禁 ▾", panel.permissionButtonTextForTest())
+
+            var readBlocked = false
+            try {
+                handler.handleReadTextFile(AcpModels.FsReadTextFileParams(path = "README.md"))
+            } catch (e: JsonRpcTransport.JsonRpcRemoteException) {
+                readBlocked = e.code == -32001
+            }
+            assertTrue("禁止读文件策略必须拦截 fs/read_text_file", readBlocked)
+
+            val deniedReadPerm = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Search code", kind = "search"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_reject_once", deniedReadPerm.getAsJsonObject("outcome").get("optionId").asString)
+
+            // 3. 全自动模式：自动放行编辑与终端命令
+            panel.applyDataPermissionConfig(DataPermissionConfig.FULL_AUTO)
+            assertEquals("⚡ 权限: 全自动 ▾", panel.permissionButtonTextForTest())
+
+            val autoEditRes = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Edit file", kind = "edit"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_allow_once", autoEditRes.getAsJsonObject("outcome").get("optionId").asString)
+
+            val autoCmdRes = handler.handlePermissionRequest(
+                AcpModels.PermissionRequestParams(
+                    toolCall = AcpModels.PermissionToolCall(title = "Run gradle test", kind = "execute"),
+                    options = stdOptions
+                )
+            )
+            assertEquals("opt_allow_once", autoCmdRes.getAsJsonObject("outcome").get("optionId").asString)
+            assertTrue("拦截记录应写入诊断日志", logs.isNotEmpty())
+        } finally {
+            settings.setDataPermissionConfig(original)
+            Disposer.dispose(panel)
         }
     }
 }

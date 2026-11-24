@@ -153,7 +153,11 @@ class GeminiAcpConfigurable : Configurable {
     }
 
     override fun apply() {
-        val state = GeminiAcpSettingsState.getInstance().state
+        val settingsService = GeminiAcpSettingsState.getInstance()
+        val state = settingsService.state
+        val oldDiff = state.requireDiffBeforeWrite
+        val oldAutoRead = state.autoApproveReadTools
+
         state.geminiExecutablePath = executableField.text.trim()
         state.acpFlag = acpFlagBox.selectedItem as? String ?: "--acp"
         state.authMethodId = authMethodBox.selectedItem as? String ?: "oauth-personal"
@@ -161,6 +165,12 @@ class GeminiAcpConfigurable : Configurable {
         state.stripGeminiApiKeyEnv = stripApiKeyCheck.isSelected
         state.requireDiffBeforeWrite = requireDiffCheck.isSelected
         state.autoApproveReadTools = autoApproveReadCheck.isSelected
+        if (oldAutoRead != state.autoApproveReadTools) {
+            state.readFilePermission = if (state.autoApproveReadTools) "AUTO" else "ASK"
+        }
+        if (oldDiff != state.requireDiffBeforeWrite && !state.readOnlyMode) {
+            state.writeFilePermission = if (state.requireDiffBeforeWrite) "ASK" else "AUTO"
+        }
         state.includeActiveFileByDefault = includeActiveFileCheck.isSelected
         state.enableEmbeddedContext = enableEmbeddedContextCheck.isSelected
         state.loadProjectRulesFile = loadProjectRulesCheck.isSelected

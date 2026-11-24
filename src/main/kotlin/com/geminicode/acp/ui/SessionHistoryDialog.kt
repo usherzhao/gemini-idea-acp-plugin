@@ -55,7 +55,7 @@ class SessionHistoryDialog(
     private val searchField = JBTextField().apply {
         emptyText.text = "按对话标题或目录关键词搜索..."
     }
-    private val currentProjectOnlyCheck = JBCheckBox("仅显示当前项目", true)
+    private val currentProjectOnlyCheck = JBCheckBox("仅显示当前项目", false)
     private val renameButton = JButton("重命名").apply {
         isEnabled = false
         toolTipText = "修改选中对话的显示名称（快捷键 F2）"
@@ -279,7 +279,7 @@ class SessionHistoryDialog(
         statusLabel.text = if (onlyCurrent) {
             "共 ${allSessions.size} 条历史记录，当前项目显示 ${filtered.size} 条（取消勾选可看全部；双击切换，右键/F2 重命名）"
         } else {
-            "共 ${allSessions.size} 条历史记录，当前显示 ${filtered.size} 条（双击切换，右键/F2 重命名）"
+            "共 ${allSessions.size} 条历史记录，当前显示 ${filtered.size} 条（勾选「仅显示当前项目」可按目录筛选；双击切换，右键/F2 重命名）"
         }
     }
 

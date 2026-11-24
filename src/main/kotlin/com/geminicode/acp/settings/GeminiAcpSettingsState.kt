@@ -1,5 +1,7 @@
 package com.geminicode.acp.settings
 
+import com.geminicode.acp.ide.AccessLevel
+import com.geminicode.acp.ide.DataPermissionConfig
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.Service
@@ -25,6 +27,10 @@ class GeminiAcpSettingsState : PersistentStateComponent<GeminiAcpSettingsState.S
         var allowNpxFallback: Boolean = true,
         var requireDiffBeforeWrite: Boolean = true,
         var autoApproveReadTools: Boolean = true,
+        var readOnlyMode: Boolean = false,
+        var readFilePermission: String = "",
+        var writeFilePermission: String = "",
+        var commandPermission: String = "ASK",
         var proxyUrl: String = "",
         var googleCloudProject: String = "",
         var includeActiveFileByDefault: Boolean = true,
@@ -35,6 +41,7 @@ class GeminiAcpSettingsState : PersistentStateComponent<GeminiAcpSettingsState.S
         var agyDisableTelemetry: Boolean = false,
         var agyAgentName: String = "",
         var maxAttachedFileChars: Int = 60_000,
+        var lastLoggedInEmail: String = "",
         var customSessionTitles: MutableMap<String, String> = mutableMapOf(),
         var projectAdditionalDirectories: MutableMap<String, MutableList<String>> = mutableMapOf()
     )
@@ -45,6 +52,33 @@ class GeminiAcpSettingsState : PersistentStateComponent<GeminiAcpSettingsState.S
 
     override fun loadState(state: State) {
         XmlSerializerUtil.copyBean(state, myState)
+    }
+
+    fun getDataPermissionConfig(): DataPermissionConfig {
+        val readDefault = if (myState.autoApproveReadTools) AccessLevel.AUTO else AccessLevel.ASK
+        val writeDefault = if (myState.requireDiffBeforeWrite) AccessLevel.ASK else AccessLevel.AUTO
+        return DataPermissionConfig(
+            readOnlyMode = myState.readOnlyMode,
+            readFile = AccessLevel.fromStoredName(myState.readFilePermission, readDefault),
+            writeFile = AccessLevel.fromStoredName(myState.writeFilePermission, writeDefault),
+            command = AccessLevel.fromStoredName(myState.commandPermission, AccessLevel.ASK)
+        )
+    }
+
+    fun setDataPermissionConfig(config: DataPermissionConfig) {
+        myState.readOnlyMode = config.readOnlyMode
+        myState.readFilePermission = config.readFile.name
+        myState.writeFilePermission = config.writeFile.name
+        myState.commandPermission = config.command.name
+        myState.autoApproveReadTools = config.effectiveReadLevel() == AccessLevel.AUTO
+        myState.requireDiffBeforeWrite = config.effectiveWriteLevel() != AccessLevel.AUTO
+    }
+
+    fun getLastLoggedInEmail(): String? =
+        myState.lastLoggedInEmail.trim().takeIf { it.isNotEmpty() }
+
+    fun setLastLoggedInEmail(email: String?) {
+        myState.lastLoggedInEmail = email?.trim().orEmpty()
     }
 
     fun getCustomTitle(sessionId: String): String? =

@@ -17,12 +17,16 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 基于标准输入输出 (stdio) 的双向 JSON-RPC 2.0 传输层，用于与 Gemini CLI ACP 子进程通信。
+ * 基于标准输入输出 (stdio) 的双向 JSON-RPC 2.0 传输层，用于与 Antigravity / Gemini CLI ACP 子进程通信。
+ * 支持普通固定超时与流式空闲超时（idleTimeout）：流式请求在持续收到 `session/update` 或等待用户审批弹窗时自动续期，避免长对话误报超时。
  */
 class JsonRpcTransport(
     private val command: List<String>,
@@ -49,9 +53,14 @@ class JsonRpcTransport(
     private val closed = AtomicBoolean(false)
     private val writeLock = Any()
     private val stderrBuffer = StringBuilder()
+    private val lastActivityNanos = AtomicLong(System.nanoTime())
+    private val activeIncomingRequests = AtomicInteger(0)
 
     private val workerExecutor: ExecutorService = Executors.newCachedThreadPool { r ->
         Thread(r, "GeminiAcp-RpcWorker").apply { isDaemon = true }
+    }
+    private val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "GeminiAcp-TimeoutWatchdog").apply { isDaemon = true }
     }
 
     @Volatile
@@ -70,6 +79,7 @@ class JsonRpcTransport(
         val proc = pb.start()
         process = proc
         writer = BufferedWriter(OutputStreamWriter(proc.outputStream, StandardCharsets.UTF_8))
+        touchActivity()
 
         Thread({ readStdoutLoop(proc) }, "GeminiAcp-Stdout").apply {
             isDaemon = true
@@ -83,7 +93,17 @@ class JsonRpcTransport(
 
     fun isAlive(): Boolean = process?.isAlive == true && !closed.get()
 
-    fun sendRequest(method: String, params: Any?, timeoutSeconds: Long = 120): CompletableFuture<JsonElement> {
+    /**
+     * 发送 JSON-RPC 请求。
+     * @param timeoutSeconds 超时秒数；当 [idleTimeout] 为 true 时表示「连续无流式消息的空闲超时秒数」，
+     * 只要持续收到通知、响应或正在等待用户权限/Diff 确认弹窗，总耗时不受限制。
+     */
+    fun sendRequest(
+        method: String,
+        params: Any?,
+        timeoutSeconds: Long = 120,
+        idleTimeout: Boolean = false
+    ): CompletableFuture<JsonElement> {
         if (!isAlive()) {
             return CompletableFuture.failedFuture(IllegalStateException("ACP 子进程未运行"))
         }
@@ -99,6 +119,7 @@ class JsonRpcTransport(
         }
 
         try {
+            touchActivity()
             writeLine(gson.toJson(payload))
         } catch (t: Throwable) {
             pending.remove(id)
@@ -106,9 +127,48 @@ class JsonRpcTransport(
             return future
         }
 
-        return future.orTimeout(timeoutSeconds, TimeUnit.SECONDS).whenComplete { _, err ->
-            if (err != null) pending.remove(id)
+        if (timeoutSeconds <= 0L) {
+            return future
         }
+
+        if (!idleTimeout) {
+            val timeoutTask = timeoutScheduler.schedule({
+                if (pending.remove(id, future)) {
+                    future.completeExceptionally(
+                        TimeoutException("ACP 请求 $method 超时（超过 ${timeoutSeconds} 秒未返回）")
+                    )
+                }
+            }, timeoutSeconds, TimeUnit.SECONDS)
+            future.whenComplete { _, err ->
+                timeoutTask.cancel(false)
+                if (err != null) pending.remove(id, future)
+            }
+            return future
+        }
+
+        val idleLimitNanos = TimeUnit.SECONDS.toNanos(timeoutSeconds)
+        val checkIntervalMs = (timeoutSeconds * 250L).coerceIn(200L, 5_000L)
+        val watchdog = timeoutScheduler.scheduleAtFixedRate({
+            if (future.isDone || closed.get()) return@scheduleAtFixedRate
+            if (activeIncomingRequests.get() > 0) {
+                touchActivity()
+                return@scheduleAtFixedRate
+            }
+            val silentNanos = System.nanoTime() - lastActivityNanos.get()
+            if (silentNanos >= idleLimitNanos) {
+                if (pending.remove(id, future)) {
+                    future.completeExceptionally(
+                        TimeoutException("ACP 请求 $method 超过 ${timeoutSeconds} 秒无任何流式响应（空闲超时）")
+                    )
+                }
+            }
+        }, checkIntervalMs, checkIntervalMs, TimeUnit.MILLISECONDS)
+
+        future.whenComplete { _, err ->
+            watchdog.cancel(false)
+            if (err != null) pending.remove(id, future)
+        }
+        return future
     }
 
     fun sendNotification(method: String, params: Any?) {
@@ -118,6 +178,7 @@ class JsonRpcTransport(
             addProperty("method", method)
             add("params", gson.toJsonTree(params))
         }
+        touchActivity()
         runCatching { writeLine(gson.toJson(payload)) }
             .onFailure { logger.warn("发送通知 $method 失败", it) }
     }
@@ -132,7 +193,12 @@ class JsonRpcTransport(
         val err = IllegalStateException("ACP 连接已关闭")
         pending.values.forEach { it.completeExceptionally(err) }
         pending.clear()
+        timeoutScheduler.shutdownNow()
         workerExecutor.shutdownNow()
+    }
+
+    private fun touchActivity() {
+        lastActivityNanos.set(System.nanoTime())
     }
 
     private fun terminateProcessTree(proc: Process) {
@@ -168,6 +234,7 @@ class JsonRpcTransport(
             BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8)).use { reader ->
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
+                    touchActivity()
                     val trimmed = line!!.trim()
                     if (trimmed.isEmpty()) continue
                     runCatching { handleIncomingLine(trimmed) }
@@ -263,6 +330,8 @@ class JsonRpcTransport(
     }
 
     private fun dispatchIncomingRequest(idElem: JsonElement, method: String, params: JsonObject) {
+        activeIncomingRequests.incrementAndGet()
+        touchActivity()
         workerExecutor.submit {
             val response = JsonObject().apply {
                 addProperty("jsonrpc", "2.0")
@@ -282,6 +351,9 @@ class JsonRpcTransport(
                     addProperty("code", -32603)
                     addProperty("message", t.message ?: "IDE 内部处理异常")
                 })
+            } finally {
+                activeIncomingRequests.decrementAndGet()
+                touchActivity()
             }
             runCatching { writeLine(gson.toJson(response)) }
                 .onFailure { logger.warn("返回 RPC 响应失败 ($method)", it) }

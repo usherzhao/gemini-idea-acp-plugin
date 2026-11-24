@@ -1,7 +1,9 @@
 package com.geminicode.acp.ui
 
+import com.geminicode.acp.ide.AccessLevel
 import com.geminicode.acp.ide.AcpContextBuilder
 import com.geminicode.acp.ide.CodeReference
+import com.geminicode.acp.ide.DataPermissionConfig
 import com.geminicode.acp.ide.EditorDiffApplyUtil
 import com.geminicode.acp.ide.IdeaContextCollector
 import com.geminicode.acp.ide.ImageAttachmentHelper
@@ -18,6 +20,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
@@ -36,8 +39,6 @@ import java.awt.Color
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
-import java.awt.GridBagConstraints
-import java.awt.GridBagLayout
 import java.awt.Insets
 import java.awt.Rectangle
 import java.awt.Toolkit
@@ -52,6 +53,10 @@ import java.awt.event.FocusEvent
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.io.File
+import java.net.URI
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+import java.nio.file.Paths
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -64,6 +69,7 @@ import javax.swing.JPanel
 import javax.swing.ScrollPaneConstants
 import javax.swing.Scrollable
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import javax.swing.border.CompoundBorder
 import javax.swing.border.LineBorder
 import javax.swing.event.DocumentEvent
@@ -106,7 +112,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         toolTipText = "退出当前账号并通过官方 ACP 重新登录 / 切换 Google 账号"
     }
     private val terminalLoginButton = JButton("终端登录").apply {
-        toolTipText = "打开终端执行 agy acp --login 完成交互式浏览器授权"
+        toolTipText = "打开内置交互登录框执行 agy acp --login（支持直接粘贴授权码并自动连接刷新状态）"
     }
     private val historyButton = JButton("历史记录")
     private val newSessionButton = JButton("新对话")
@@ -117,19 +123,23 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     private val settingsButton = JButton("设置")
 
     /**
-     * 底部动态配置栏：完全由官方服务端返回的 configOptions（model / thought_level / mode 等）渲染。
+     * 底部动态配置栏：将模型 / 思考强度 / 模式紧凑排列在同一行，避免下拉框过长占用空间。
      */
-    private val selectorRow = JPanel(GridBagLayout()).apply {
+    private val selectorRow = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
         isOpaque = false
         isVisible = false
         border = JBUI.Borders.empty(4, 2, 2, 2)
     }
     private var updatingSelectors = false
 
+    private enum class BannerActionMode { OPEN_URL, LAUNCH_LOGIN, CONNECT_NOW }
+
     private val bannerPanel = JPanel(BorderLayout(8, 4))
     private val bannerText = JBLabel()
     private val bannerActionBtn = JButton("打开授权页")
     private var detectedAuthUrl: String? = null
+    private var bannerActionMode: BannerActionMode = BannerActionMode.LAUNCH_LOGIN
 
     private val logArea = JBTextArea(6, 40).apply {
         isEditable = false
@@ -169,6 +179,10 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
     private val attachContextCheck = JBCheckBox("自动引用当前文件/行号", true)
     private val contextBadgeLabel = JBLabel("")
+    private val permissionButton = JButton().apply {
+        font = font.deriveFont(11f)
+        margin = Insets(1, 6, 1, 6)
+    }
     private val attachImageButton = JButton("🖼️ 图片").apply {
         font = font.deriveFont(11f)
         margin = Insets(1, 6, 1, 6)
@@ -362,6 +376,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         override fun onAuthUrlDetected(url: String) {
             runOnUi {
                 detectedAuthUrl = url
+                bannerActionMode = BannerActionMode.OPEN_URL
                 bannerText.text = "<html>需要 Google 授权登录，点击右侧按钮在浏览器完成 <code>oauth-personal</code> 授权：</html>"
                 bannerActionBtn.text = "打开授权页"
                 bannerPanel.isVisible = true
@@ -393,6 +408,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             statusLabel.toolTipText = acpService.capabilities.toTooltipHtml()
         }
         refreshAdditionalDirsButton()
+        refreshPermissionButton()
         preloadLocalSkillsAsync()
         refreshAccountStatus()
         refreshContextPreview()
@@ -548,6 +564,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
         val contextActions = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
             isOpaque = false
+            add(permissionButton)
             add(attachImageButton)
             add(refreshCtxBtn)
         }
@@ -593,55 +610,78 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         add(southStack, BorderLayout.SOUTH)
     }
 
-    private fun rebuildOfficialConfigSelectors(metadata: AcpModels.SessionMetadata) {
+    internal fun rebuildOfficialConfigSelectors(metadata: AcpModels.SessionMetadata) {
         updatingSelectors = true
         try {
             selectorRow.removeAll()
             val selectOptions = metadata.configOptions.filter { it.type == "select" && it.options.isNotEmpty() }
 
             if (selectOptions.isNotEmpty()) {
-                var row = 0
-                val primaryModel = selectOptions.firstOrNull { (it.category ?: it.id) == "model" }
-                if (primaryModel != null) {
-                    addFullWidthConfigSelector(primaryModel, row++)
-                }
-                val others = selectOptions.filter { it !== primaryModel }
-                var col = 0
-                for (cfg in others) {
-                    addPairedConfigSelector(cfg, row, col)
-                    col++
-                    if (col >= 2) {
-                        col = 0
-                        row++
+                val ordered = selectOptions.sortedBy { cfg ->
+                    when (cfg.category ?: cfg.id) {
+                        "model" -> 0
+                        "thought_level" -> 1
+                        "mode" -> 2
+                        else -> 3
                     }
+                }
+                val rows = ordered.chunked(3)
+                rows.forEachIndexed { rowIdx, rowItems ->
+                    if (rowIdx > 0) {
+                        selectorRow.add(Box.createVerticalStrut(JBUI.scale(4)))
+                    }
+                    val linePanel = createCompactSelectorLine()
+                    rowItems.forEachIndexed { idx, cfg ->
+                        if (idx > 0) {
+                            linePanel.add(Box.createHorizontalStrut(JBUI.scale(10)))
+                        }
+                        val combo = createOfficialCombo(cfg)
+                        applyCompactComboSizing(combo, cfg.category ?: cfg.id)
+                        addLabeledCompactCombo(linePanel, formatConfigOptionLabel(cfg), combo)
+                    }
+                    linePanel.add(Box.createHorizontalGlue())
+                    selectorRow.add(linePanel)
                 }
                 selectorRow.isVisible = true
             } else if (metadata.models.isNotEmpty() || metadata.modes.isNotEmpty()) {
-                var row = 0
+                val linePanel = createCompactSelectorLine()
+                var addedAny = false
                 if (metadata.models.isNotEmpty()) {
                     val modelCombo = ComboBox(DefaultComboBoxModel(metadata.models.toTypedArray()))
                     metadata.models.firstOrNull { it.modelId == metadata.currentModelId }?.let {
                         modelCombo.selectedItem = it
+                        modelCombo.toolTipText = it.name ?: it.modelId
                     }
                     modelCombo.addActionListener {
                         if (updatingSelectors) return@addActionListener
                         val item = modelCombo.selectedItem as? AcpModels.ModelInfo ?: return@addActionListener
+                        modelCombo.toolTipText = item.name ?: item.modelId
                         acpService.setModel(item.modelId)
                     }
-                    addFullWidthRow("模型：", modelCombo, row++)
+                    applyCompactComboSizing(modelCombo, "model")
+                    addLabeledCompactCombo(linePanel, "模型：", modelCombo)
+                    addedAny = true
                 }
                 if (metadata.modes.isNotEmpty()) {
+                    if (addedAny) {
+                        linePanel.add(Box.createHorizontalStrut(JBUI.scale(10)))
+                    }
                     val modeCombo = ComboBox(DefaultComboBoxModel(metadata.modes.toTypedArray()))
                     metadata.modes.firstOrNull { it.id == metadata.currentModeId }?.let {
                         modeCombo.selectedItem = it
+                        modeCombo.toolTipText = it.description ?: it.name
                     }
                     modeCombo.addActionListener {
                         if (updatingSelectors) return@addActionListener
                         val item = modeCombo.selectedItem as? AcpModels.ModeInfo ?: return@addActionListener
+                        modeCombo.toolTipText = item.description ?: item.name
                         acpService.setMode(item.id)
                     }
-                    addFullWidthRow("模式：", modeCombo, row)
+                    applyCompactComboSizing(modeCombo, "mode")
+                    addLabeledCompactCombo(linePanel, "模式：", modeCombo)
                 }
+                linePanel.add(Box.createHorizontalGlue())
+                selectorRow.add(linePanel)
                 selectorRow.isVisible = true
             } else {
                 selectorRow.isVisible = false
@@ -654,17 +694,48 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
     }
 
+    private fun createCompactSelectorLine(): JPanel {
+        return JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.X_AXIS)
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
+    }
+
+    private fun addLabeledCompactCombo(linePanel: JPanel, labelText: String, combo: ComboBox<*>) {
+        val label = JBLabel(labelText).apply {
+            alignmentY = CENTER_ALIGNMENT
+        }
+        combo.alignmentY = CENTER_ALIGNMENT
+        linePanel.add(label)
+        linePanel.add(Box.createHorizontalStrut(JBUI.scale(2)))
+        linePanel.add(combo)
+    }
+
+    private fun applyCompactComboSizing(combo: ComboBox<*>, categoryKey: String) {
+        val (minW, prefW, maxW) = when (categoryKey) {
+            "model" -> Triple(96, 165, 185)
+            "thought_level" -> Triple(62, 84, 96)
+            "mode" -> Triple(76, 112, 128)
+            else -> Triple(76, 115, 140)
+        }
+        val height = combo.preferredSize.height.coerceAtLeast(JBUI.scale(26))
+        combo.minimumSize = Dimension(JBUI.scale(minW), height)
+        combo.preferredSize = Dimension(JBUI.scale(prefW), height)
+        combo.maximumSize = Dimension(JBUI.scale(maxW), height)
+    }
+
     private fun createOfficialCombo(cfg: AcpModels.ConfigOption): ComboBox<AcpModels.ConfigSelectOption> {
         val combo = ComboBox(DefaultComboBoxModel(cfg.options.toTypedArray()))
         val selected = cfg.options.firstOrNull { it.value == cfg.currentValue }
         if (selected != null) {
             combo.selectedItem = selected
-            combo.toolTipText = selected.description
+            combo.toolTipText = formatConfigOptionTooltip(selected)
         }
         combo.addActionListener {
             if (updatingSelectors) return@addActionListener
             val chosen = combo.selectedItem as? AcpModels.ConfigSelectOption ?: return@addActionListener
-            combo.toolTipText = chosen.description
+            combo.toolTipText = formatConfigOptionTooltip(chosen)
             acpService.setConfigOption(cfg.id, chosen.value).whenComplete { _, err ->
                 if (err != null) {
                     runOnUi {
@@ -677,54 +748,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         return combo
     }
 
-    private fun addFullWidthConfigSelector(cfg: AcpModels.ConfigOption, row: Int) {
-        addFullWidthRow(formatConfigOptionLabel(cfg), createOfficialCombo(cfg), row)
-    }
-
-    private fun addFullWidthRow(labelText: String, combo: ComboBox<*>, row: Int) {
-        selectorRow.add(
-            JBLabel(labelText),
-            GridBagConstraints().apply {
-                gridx = 0
-                gridy = row
-                anchor = GridBagConstraints.WEST
-                insets = Insets(2, 2, 2, 4)
-            }
-        )
-        selectorRow.add(
-            combo,
-            GridBagConstraints().apply {
-                gridx = 1
-                gridy = row
-                gridwidth = 3
-                weightx = 1.0
-                fill = GridBagConstraints.HORIZONTAL
-                insets = Insets(2, 0, 2, 2)
-            }
-        )
-    }
-
-    private fun addPairedConfigSelector(cfg: AcpModels.ConfigOption, row: Int, pairIndex: Int) {
-        val baseX = pairIndex * 2
-        selectorRow.add(
-            JBLabel(formatConfigOptionLabel(cfg)),
-            GridBagConstraints().apply {
-                gridx = baseX
-                gridy = row
-                anchor = GridBagConstraints.WEST
-                insets = Insets(2, if (pairIndex == 0) 2 else 8, 2, 4)
-            }
-        )
-        selectorRow.add(
-            createOfficialCombo(cfg),
-            GridBagConstraints().apply {
-                gridx = baseX + 1
-                gridy = row
-                weightx = 0.5
-                fill = GridBagConstraints.HORIZONTAL
-                insets = Insets(2, 0, 2, 2)
-            }
-        )
+    private fun formatConfigOptionTooltip(opt: AcpModels.ConfigSelectOption): String {
+        val desc = opt.description?.takeIf { it.isNotBlank() }
+        return if (desc != null) "${opt.name} — $desc" else opt.name
     }
 
     private fun formatConfigOptionLabel(cfg: AcpModels.ConfigOption): String {
@@ -739,9 +765,10 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     private fun wireActions() {
         connectButton.addActionListener { triggerConnect() }
         switchAccountButton.addActionListener { triggerSwitchAccount() }
-        terminalLoginButton.addActionListener { TerminalLoginLauncher.launchInteractiveGeminiLogin(project) }
+        terminalLoginButton.addActionListener { triggerInteractiveLogin() }
         historyButton.addActionListener { openHistoryDialog() }
         additionalDirsButton.addActionListener { openAdditionalDirectoriesDialog() }
+        permissionButton.addActionListener { openDataPermissionPopover() }
         attachImageButton.addActionListener { chooseImageFiles() }
         renameCurrentButton.addActionListener { renameCurrentSession() }
         logToggleButton.addActionListener {
@@ -770,13 +797,23 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         settingsButton.addActionListener {
             ShowSettingsUtil.getInstance().showSettingsDialog(project, GeminiAcpConfigurable::class.java)
             refreshAccountStatus()
+            refreshPermissionButton()
         }
         bannerActionBtn.addActionListener {
-            val url = detectedAuthUrl
-            if (!url.isNullOrBlank()) {
-                BrowserUtil.browse(url)
-            } else {
-                TerminalLoginLauncher.launchInteractiveGeminiLogin(project)
+            when (bannerActionMode) {
+                BannerActionMode.OPEN_URL -> {
+                    val url = detectedAuthUrl
+                    if (!url.isNullOrBlank()) {
+                        BrowserUtil.browse(url)
+                    } else {
+                        triggerInteractiveLogin()
+                    }
+                }
+                BannerActionMode.CONNECT_NOW -> {
+                    loggedOutExplicitly = false
+                    triggerConnect(showSuccessBanner = true)
+                }
+                BannerActionMode.LAUNCH_LOGIN -> triggerInteractiveLogin()
             }
         }
         sendOrStopButton.addActionListener {
@@ -1174,6 +1211,35 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         additionalDirsButton.text = if (count > 0) "关联目录($count)" else "关联目录"
     }
 
+    private fun openDataPermissionPopover() {
+        val settingsService = GeminiAcpSettingsState.getInstance()
+        DataPermissionPopover.show(permissionButton, settingsService.getDataPermissionConfig()) { updated ->
+            applyDataPermissionConfig(updated)
+        }
+    }
+
+    internal fun applyDataPermissionConfig(updated: DataPermissionConfig) {
+        GeminiAcpSettingsState.getInstance().setDataPermissionConfig(updated)
+        refreshPermissionButton()
+        acpService.onDataPermissionsChanged(updated)
+    }
+
+    internal fun permissionButtonTextForTest(): String = permissionButton.text
+
+    private fun refreshPermissionButton() {
+        val cfg = GeminiAcpSettingsState.getInstance().getDataPermissionConfig()
+        permissionButton.text = cfg.summaryBadgeText()
+        permissionButton.toolTipText = cfg.tooltipHtml()
+        permissionButton.foreground = when {
+            cfg.readOnlyMode -> JBColor(Color(0x1D4ED8), Color(0x60A5FA))
+            cfg.isFullAutoPreset() -> JBColor(Color(0xB45309), Color(0xFBBF24))
+            cfg.effectiveReadLevel() == AccessLevel.DENY ||
+                cfg.effectiveWriteLevel() == AccessLevel.DENY ||
+                cfg.effectiveCommandLevel() == AccessLevel.DENY -> JBColor(Color(0x4338CA), Color(0x818CF8))
+            else -> UIUtil.getLabelForeground()
+        }
+    }
+
     private fun chooseImageFiles() {
         val descriptor = FileChooserDescriptor(true, false, false, false, false, true)
             .withFileFilter { vFile ->
@@ -1212,6 +1278,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
     }
 
     internal fun pendingImageCount(): Int = pendingImages.size
+
+    internal fun selectorLinePanelsForTest(): List<JPanel> =
+        selectorRow.components.filterIsInstance<JPanel>()
 
     private fun rebuildImagesBar() {
         imagesBar.removeAll()
@@ -1309,6 +1378,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             bannerText.text = "<html>未检测到 <code>agy</code> (Antigravity CLI)，请先安装 https://antigravity.google 或在设置中指定路径。</html>"
             bannerActionBtn.text = "获取 Antigravity CLI"
             detectedAuthUrl = "https://antigravity.google"
+            bannerActionMode = BannerActionMode.OPEN_URL
             bannerPanel.isVisible = true
             return
         }
@@ -1340,12 +1410,14 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                             val root = (err as? java.util.concurrent.CompletionException)?.cause ?: err
                             if (root is AcpClientService.LogoutNotSupportedException) {
                                 detectedAuthUrl = null
-                                bannerText.text = "<html>当前 CLI 后端未支持 ACP <code>logout</code>，请点击右侧打开终端重新登录：</html>"
-                                bannerActionBtn.text = "打开终端登录"
+                                bannerActionMode = BannerActionMode.LAUNCH_LOGIN
+                                bannerText.text = "<html>当前 CLI 后端未支持 ACP <code>logout</code>，请点击右侧打开交互登录框重新登录：</html>"
+                                bannerActionBtn.text = "打开交互登录"
                                 bannerPanel.isVisible = true
                             } else if (detectedAuthUrl == null) {
-                                bannerText.text = "<html>已退出旧账号，若浏览器未自动打开授权页，请点击右侧通过终端执行 <code>agy acp --login</code>：</html>"
-                                bannerActionBtn.text = "打开终端登录"
+                                bannerActionMode = BannerActionMode.LAUNCH_LOGIN
+                                bannerText.text = "<html>已退出旧账号，若浏览器未自动打开授权页，请点击右侧执行 <code>agy acp --login</code> 交互登录：</html>"
+                                bannerActionBtn.text = "打开交互登录"
                                 bannerPanel.isVisible = true
                             }
                             val card = AssistantTurnCard()
@@ -1353,8 +1425,8 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                             card.appendBody(
                                 "⚠️ 切换账号 / 重新登录未完成：${root.message}\n\n" +
                                     "排查与操作建议：\n" +
-                                    "1. 若浏览器已弹出 Google 登录页，请完成账号选择授权后点击顶部 **「登录/连接」**；\n" +
-                                    "2. 若未自动弹出浏览器，请点击顶部 **「终端登录」** 运行 `agy acp --login` 完成新账号授权，再点击 **「登录/连接」**；\n" +
+                                    "1. 点击顶部 **「终端登录」**（或上方黄色提示条按钮），在内置登录框内粘贴网页授权码即可自动完成登录并刷新状态；\n" +
+                                    "2. 若已在外部完成授权，请点击顶部 **「登录/连接」**；\n" +
                                     "3. 如需代理访问 Google 服务，请点击 **「设置」** 填写 `HTTP/HTTPS_PROXY`。"
                             )
                             card.finalizeTurn("error")
@@ -1373,7 +1445,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
                             messagesContainer.removeAll()
                             addWelcomeCard()
                             val msg = if (serverLoggedOut) {
-                                "已退出当前账号登录状态。点击顶部 <b>「登录/连接」</b> 或 <b>「切换账号」</b> 即可使用其他账号重新登录。"
+                                "已退出当前账号登录状态。点击顶部 <b>「登录/连接」</b>、<b>「切换账号」</b> 或 <b>「终端登录」</b> 即可使用其他账号重新登录。"
                             } else {
                                 "已断开当前连接（旧版 CLI 不支持 ACP <code>logout</code>，请使用顶部 <b>「终端登录」</b> 重新授权）。"
                             }
@@ -1388,7 +1460,60 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
     }
 
-    private fun triggerConnect() {
+    private fun triggerInteractiveLogin() {
+        if (isStreaming || isLoadingHistory) {
+            Messages.showInfoMessage(project, "请先等待当前生成或历史加载完成，再执行终端登录。", "终端登录")
+            return
+        }
+        val settings = GeminiAcpSettingsState.getInstance().state
+        val resolved = GeminiExecutableResolver.resolveExecutable(
+            settings.geminiExecutablePath,
+            allowNpxFallback = false
+        )
+        if (!resolved.found || resolved.executablePath == null) {
+            TerminalLoginLauncher.launchInteractiveGeminiLogin(project)
+            return
+        }
+
+        if (resolved.backendKind == GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY) {
+            val dialog = AgyInteractiveLoginDialog(project, resolved)
+            if (dialog.showAndGet() && dialog.loginSucceeded) {
+                loggedOutExplicitly = false
+                acpService.rememberLoggedInEmail(dialog.loggedInEmail)
+                appendDiagnosticLog(
+                    "内置交互登录成功" + (dialog.loggedInEmail?.let { "（$it）" } ?: "") + "，正在自动连接 ACP 服务..."
+                )
+                triggerConnect(showSuccessBanner = true)
+            } else if (dialog.fallbackToExternalTerminal) {
+                launchExternalTerminalAndAutoConnect()
+            }
+        } else {
+            launchExternalTerminalAndAutoConnect()
+        }
+    }
+
+    private fun launchExternalTerminalAndAutoConnect() {
+        detectedAuthUrl = null
+        bannerActionMode = BannerActionMode.CONNECT_NOW
+        bannerText.text = "<html>已打开外部终端窗口（<code>Antigravity ACP 登录</code>），将网页授权码粘贴回该终端按回车后将自动连接；如已完成也可点击右侧：</html>"
+        bannerActionBtn.text = "已完成，立即连接"
+        bannerPanel.isVisible = true
+
+        TerminalLoginLauncher.launchInteractiveGeminiLogin(project) { exitCode ->
+            runOnUi {
+                if (exitCode == 0) {
+                    loggedOutExplicitly = false
+                    appendDiagnosticLog("外部终端登录成功（exit 0），正在自动连接并刷新状态...")
+                    triggerConnect(showSuccessBanner = true)
+                } else {
+                    appendDiagnosticLog("外部终端登录进程已结束（退出码 $exitCode），如已完成登录可手动点击「登录/连接」")
+                }
+            }
+        }
+    }
+
+    private fun triggerConnect(showSuccessBanner: Boolean = false) {
+        val wasLoggedOut = loggedOutExplicitly
         val settings = GeminiAcpSettingsState.getInstance().state
         val resolved = GeminiExecutableResolver.resolveExecutable(
             settings.geminiExecutablePath,
@@ -1398,22 +1523,33 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             bannerText.text = "<html>未检测到 <code>agy</code> (Antigravity CLI)，请先安装 https://antigravity.google 或在设置中指定路径。</html>"
             bannerActionBtn.text = "获取 Antigravity CLI"
             detectedAuthUrl = "https://antigravity.google"
+            bannerActionMode = BannerActionMode.OPEN_URL
             bannerPanel.isVisible = true
             return
         }
         acpService.connectAndAuthenticate().whenComplete { _, err ->
-            if (err != null) {
-                runOnUi {
+            runOnUi {
+                if (err == null) {
+                    loggedOutExplicitly = false
+                    bannerPanel.isVisible = false
+                    refreshAccountStatus()
+                    if (showSuccessBanner || wasLoggedOut) {
+                        val emailHint = acpService.resolveLoggedInEmail()?.let { "（$it）" }.orEmpty()
+                        addHistoryBannerCard("✅ 已登录并连接成功$emailHint，现在可以直接开始对话。")
+                        scrollToBottom()
+                    }
+                } else {
                     val card = AssistantTurnCard()
                     addCard(card)
                     card.appendBody(
                         "⚠️ 连接或 `oauth-personal` 登录失败：${err.message}\n\n" +
                             "排查建议：\n" +
-                            "1. 点击顶部 **「终端登录」** 运行 `agy acp --login` 完成 Google 浏览器登录；\n" +
+                            "1. 点击顶部 **「终端登录」** 运行 `agy acp --login`，在内置登录框中回填网页授权码，完成后会自动连接刷新；\n" +
                             "2. 如需代理访问 Google 服务，请点击 **「设置」** 填写 `HTTP/HTTPS_PROXY`；\n" +
                             "3. 点击 **「日志」** 查看详细输出。"
                     )
                     card.finalizeTurn("error")
+                    scrollToBottom()
                 }
             }
         }
@@ -1483,8 +1619,15 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         addCard(assistantCard)
         scrollToBottom()
 
-        val settingsState = GeminiAcpSettingsState.getInstance().state
-        val embeddedResources = if (settingsState.enableEmbeddedContext) {
+        val settingsService = GeminiAcpSettingsState.getInstance()
+        val settingsState = settingsService.state
+        val permConfig = settingsService.getDataPermissionConfig()
+        val embeddedResources = if (permConfig.effectiveReadLevel() == AccessLevel.DENY) {
+            if (uniqueRefs.isNotEmpty() && settingsState.enableEmbeddedContext) {
+                appendDiagnosticLog("🚫 数据权限已禁止读取文件，已跳过自动附带文件内容（embeddedContext）")
+            }
+            emptyList()
+        } else if (settingsState.enableEmbeddedContext) {
             AcpContextBuilder.buildEmbeddedResourceBlocks(
                 references = uniqueRefs,
                 maxTotalChars = settingsState.maxAttachedFileChars,
@@ -1498,7 +1641,9 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         acpService.sendPrompt(fullPrompt, images, embeddedResources).whenComplete { _, err ->
             if (err != null) {
                 runOnUi {
-                    assistantCard.appendBody("\n\n❌ 请求失败：${err.message}\n\n可点击顶部「日志」查看详细原因。")
+                    val root = (err as? java.util.concurrent.CompletionException)?.cause ?: err
+                    val msg = root.message?.takeIf { it.isNotBlank() } ?: root.javaClass.simpleName
+                    assistantCard.appendBody("\n\n❌ 请求失败：$msg\n\n可点击顶部「日志」查看详细原因。")
                     assistantCard.finalizeTurn("error")
                     if (activeAssistantCard === assistantCard) {
                         activeAssistantCard = null
@@ -1518,28 +1663,42 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
     private fun refreshAccountStatus() {
         val state = acpService.currentState
+        val connected = state == AcpClientService.ConnectionState.READY ||
+            state == AcpClientService.ConnectionState.STREAMING ||
+            (acpService.isConnectedAndAuthenticated() && !loggedOutExplicitly)
         val tier = acpService.lastMetadata?.tierName
+        val email = acpService.resolveLoggedInEmail()
         val backend = acpService.activeBackendKind
-        if (loggedOutExplicitly && state != AcpClientService.ConnectionState.READY) {
+        if (loggedOutExplicitly && !connected) {
             accountLabel.text = "未登录"
+            accountLabel.toolTipText = "当前已退出登录，点击「登录/连接」或「终端登录」重新登录"
             return
         }
         if (backend == GeminiExecutableResolver.BackendKind.ANTIGRAVITY_AGY) {
             accountLabel.text = when {
-                tier != null -> "Antigravity ($tier)"
-                state == AcpClientService.ConnectionState.READY -> "Antigravity 已登录"
+                connected && email != null && tier != null -> "$email ($tier)"
+                connected && email != null -> email
+                connected && tier != null -> "Antigravity ($tier)"
+                connected -> "Antigravity 已登录"
                 else -> "未登录"
+            }
+            accountLabel.toolTipText = when {
+                connected && email != null -> "当前登录账号：$email" + (tier?.let { "（订阅：$it）" }.orEmpty())
+                connected -> "<html>已通过官方 <code>agy acp</code> 复用本地凭证连接（当前版本 ACP 协议仅返回订阅等级，不返回邮箱）。<br/>通过顶部 <b>「终端登录」</b> 完成一次交互登录后，插件将自动持久记住并显示当前账号邮箱。</html>"
+                else -> "尚未连接 ACP 服务"
             }
             return
         }
         val info = GeminiExecutableResolver.readCachedAccountInfo()
+        val displayEmail = email ?: info.activeEmail
         accountLabel.text = when {
-            tier != null && info.activeEmail != null -> "${info.activeEmail} ($tier)"
+            tier != null && displayEmail != null -> "$displayEmail ($tier)"
             tier != null -> tier
-            info.activeEmail != null -> "账号：${info.activeEmail}"
+            displayEmail != null -> "账号：$displayEmail"
             info.hasOAuthCreds -> "已检测本地登录"
             else -> "未登录"
         }
+        accountLabel.toolTipText = displayEmail?.let { "当前账号：$it" }
     }
 
     private fun refreshContextPreview() {
@@ -1661,6 +1820,37 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
 
+    private fun openChatHyperlink(ev: HyperlinkEvent) {
+        val rawUrl = ev.description?.trim()?.takeIf { it.isNotEmpty() } ?: ev.url?.toString() ?: return
+        if (rawUrl.startsWith("file://", ignoreCase = true)) {
+            if (tryOpenFileLinkInEditor(rawUrl)) return
+        }
+        ev.url?.let { BrowserUtil.browse(it) } ?: BrowserUtil.browse(rawUrl)
+    }
+
+    private fun tryOpenFileLinkInEditor(rawFileUrl: String): Boolean {
+        return runCatching {
+            val hashIdx = rawFileUrl.indexOf('#')
+            val urlPart = if (hashIdx >= 0) rawFileUrl.substring(0, hashIdx) else rawFileUrl
+            val fragment = if (hashIdx >= 0) rawFileUrl.substring(hashIdx + 1) else ""
+            val lineNumber = Regex("""^L?(\d+)""").find(fragment)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+            val filePath = runCatching {
+                Paths.get(URI(urlPart)).toAbsolutePath().normalize().toString()
+            }.getOrElse {
+                val stripped = urlPart.removePrefix("file:///").removePrefix("file://")
+                val decoded = URLDecoder.decode(stripped, StandardCharsets.UTF_8)
+                if (decoded.length >= 2 && decoded[1] == ':') decoded else "/$decoded"
+            }
+
+            val vFile = LocalFileSystem.getInstance().refreshAndFindFileByPath(filePath.replace('\\', '/'))
+                ?: return@runCatching false
+            val zeroBasedLine = ((lineNumber ?: 1) - 1).coerceAtLeast(0)
+            OpenFileDescriptor(project, vFile, zeroBasedLine, 0).navigate(true)
+            true
+        }.getOrDefault(false)
+    }
+
     private inner class AssistantTurnCard(showPendingPlaceholder: Boolean = true) : JPanel() {
         private val thoughtLabel = JBLabel()
         private val toolsPanel = JPanel().apply {
@@ -1671,17 +1861,32 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         private val bodyPane = JEditorPane("text/html", "").apply {
             isEditable = false
             isOpaque = false
+            font = UIUtil.getLabelFont()
+            putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, true)
+            border = JBUI.Borders.empty(2, 0)
             addHyperlinkListener { ev ->
-                if (ev.eventType == HyperlinkEvent.EventType.ACTIVATED && ev.url != null) {
-                    BrowserUtil.browse(ev.url)
+                if (ev.eventType == HyperlinkEvent.EventType.ACTIVATED) {
+                    openChatHyperlink(ev)
                 }
             }
+        }
+        private val bodyWrapper = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            add(bodyPane, BorderLayout.CENTER)
         }
         private val actionsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
             isOpaque = false
         }
         private val bodyBuffer = StringBuilder()
         private val thoughtBuffer = StringBuilder()
+        private val renderCoalesceTimer = Timer(45) {
+            if (!project.isDisposed && bodyBuffer.isNotEmpty()) {
+                renderBody(bodyBuffer.toString())
+            }
+        }.apply {
+            isRepeats = false
+        }
 
         init {
             alignmentX = LEFT_ALIGNMENT
@@ -1701,8 +1906,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
             add(thoughtLabel)
             toolsPanel.alignmentX = LEFT_ALIGNMENT
             add(toolsPanel)
-            bodyPane.alignmentX = LEFT_ALIGNMENT
-            add(bodyPane)
+            add(bodyWrapper)
             actionsPanel.alignmentX = LEFT_ALIGNMENT
             add(actionsPanel)
             if (showPendingPlaceholder) {
@@ -1712,7 +1916,7 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
 
         fun appendThought(chunk: String) {
             thoughtBuffer.append(chunk)
-            val preview = thoughtBuffer.toString().trim().takeLast(180).replace('\n', ' ')
+            val preview = MarkdownToHtmlConverter.stripToPlainPreview(thoughtBuffer.toString()).takeLast(180)
             thoughtLabel.text = "<html><i>思考过程：${escapeQuick(preview)}</i></html>"
             thoughtLabel.isVisible = true
         }
@@ -1756,13 +1960,21 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
 
         fun appendBody(chunk: String) {
+            val wasEmpty = bodyBuffer.isEmpty()
             bodyBuffer.append(chunk)
-            renderBody(bodyBuffer.toString())
+            if (wasEmpty) {
+                renderBody(bodyBuffer.toString())
+            } else if (!renderCoalesceTimer.isRunning) {
+                renderCoalesceTimer.start()
+            }
         }
 
         fun finalizeTurn(stopReason: String?) {
+            renderCoalesceTimer.stop()
             if (bodyBuffer.isEmpty() && stopReason != null) {
                 renderBody("（已完成：$stopReason）")
+            } else if (bodyBuffer.isNotEmpty()) {
+                renderBody(bodyBuffer.toString())
             }
             actionsPanel.removeAll()
             val blocks = MarkdownToHtmlConverter.extractCodeBlocks(bodyBuffer.toString())
@@ -1788,10 +2000,19 @@ class GeminiChatPanel(private val project: Project) : JPanel(BorderLayout()), Di
         }
 
         private fun renderBody(md: String) {
-            val textHex = "#" + ColorUtil.toHex(UIUtil.getLabelForeground())
-            val codeBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xF1F5F9), Color(0x0F172A)))
-            val borderHex = "#" + ColorUtil.toHex(JBColor.border())
-            bodyPane.text = MarkdownToHtmlConverter.toHtml(md, textHex, codeBgHex, borderHex)
+            val theme = MarkdownToHtmlConverter.RenderTheme(
+                textHex = "#" + ColorUtil.toHex(UIUtil.getLabelForeground()),
+                mutedTextHex = "#" + ColorUtil.toHex(JBColor(Color(0x475569), Color(0x9CA3AF))),
+                codeBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xF1F5F9), Color(0x161B22))),
+                codeHeaderBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xE2E8F0), Color(0x21262D))),
+                borderHex = "#" + ColorUtil.toHex(JBColor.border()),
+                linkHex = "#" + ColorUtil.toHex(JBColor(Color(0x2563EB), Color(0x60A5FA))),
+                tableHeaderBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xE2E8F0), Color(0x21262D))),
+                tableStripeBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xF8FAFC), Color(0x1A2029))),
+                quoteBgHex = "#" + ColorUtil.toHex(JBColor(Color(0xF8FAFC), Color(0x181E27))),
+                quoteBarHex = "#" + ColorUtil.toHex(JBColor(Color(0x3B82F6), Color(0x60A5FA)))
+            )
+            bodyPane.text = MarkdownToHtmlConverter.toHtml(md, theme)
             revalidate()
         }
 
